@@ -380,6 +380,7 @@ def multi_gpu_launcher(args):
     num_machines = getattr(args, "num_machines")
     main_process_ip = getattr(args, "main_process_ip")
     main_process_port = getattr(args, "main_process_port")
+    import pdb; pdb.set_trace()
     if num_machines > 1:
         setattr(args, "nproc_per_node", str(num_processes // num_machines))
         setattr(args, "nnodes", str(num_machines))
@@ -475,6 +476,7 @@ def multi_gpu_launcher(args):
 
 
 def deepspeed_launcher(args):
+    import pdb; pdb.set_trace()
     if not is_deepspeed_available():
         raise ImportError("DeepSpeed is not installed => run `pip3 install deepspeed` or build it from source.")
     cmd = ["deepspeed", "--no_local_rank"]
