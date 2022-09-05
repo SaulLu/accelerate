@@ -24,10 +24,12 @@ from .utils import (
     OffloadedWeightsLoader,
     check_device_map,
     extract_submodules_state_dict,
+    get_balanced_memory,
     infer_auto_device_map,
     load_checkpoint_in_model,
     offload_state_dict,
 )
+from .utils.versions import is_torch_version
 
 
 @contextmanager
@@ -58,6 +60,8 @@ def init_empty_weights(include_buffers: bool = False):
 
     </Tip>
     """
+    if not is_torch_version(">=", "1.9.0"):
+        raise NotImplementedError("Initializing empty weights to a meta device requires torch >= 1.9.0")
     old_register_parameter = nn.Module.register_parameter
     if include_buffers:
         old_register_buffer = nn.Module.register_buffer
@@ -65,7 +69,9 @@ def init_empty_weights(include_buffers: bool = False):
     def register_empty_parameter(module, name, param):
         old_register_parameter(module, name, param)
         if param is not None:
-            module._parameters[name] = nn.Parameter(module._parameters[name].to(torch.device("meta")))
+            param_cls = type(module._parameters[name])
+            kwargs = module._parameters[name].__dict__
+            module._parameters[name] = param_cls(module._parameters[name].to(torch.device("meta")), **kwargs)
 
     def register_empty_buffer(module, name, buffer):
         old_register_buffer(module, name, buffer)
@@ -88,6 +94,7 @@ def cpu_offload(
     execution_device: Optional[torch.device] = None,
     offload_buffers: bool = False,
     state_dict: Optional[Dict[str, torch.Tensor]] = None,
+    preload_module_classes: Optional[List[str]] = None,
 ):
     """
     Activates full CPU offload for a model. As a result, all parameters of the model will be offloaded and only one
@@ -104,13 +111,25 @@ def cpu_offload(
             Whether or not to offload the buffers with the model parameters.
         state_dict (`Dict[str, torch.Tensor]`, *optional*):
             The state dict of the model that will be kept on CPU.
+        preload_module_classes (`List[str]`, *optional*):
+            A list of classes whose instances should load all their weights (even in the submodules) at the beginning
+            of the forward. This should only be used for classes that have submodules which are registered but not
+            called directly during the forward, for instance if a `dense` linear layer is registered, but at forward,
+            `dense.weight` and `dense.bias` are used in some operations instead of calling `dense` directly.
     """
+    if not is_torch_version(">=", "1.9.0"):
+        raise NotImplementedError("CPU offloading requires torch >= 1.9.0")
     if execution_device is None:
         execution_device = next(iter(model.parameters())).device
     if state_dict is None:
         state_dict = {n: p.to("cpu") for n, p in model.state_dict().items()}
     attach_align_device_hook(
-        model, execution_device=execution_device, offload=True, offload_buffers=offload_buffers, weights_map=state_dict
+        model,
+        execution_device=execution_device,
+        offload=True,
+        offload_buffers=offload_buffers,
+        weights_map=state_dict,
+        preload_module_classes=preload_module_classes,
     )
     add_hook_to_module(model, AlignDevicesHook(io_same_device=True))
     return model
@@ -121,6 +140,7 @@ def disk_offload(
     offload_dir: Union[str, os.PathLike],
     execution_device: Optional[torch.device] = None,
     offload_buffers: bool = False,
+    preload_module_classes: Optional[List[str]] = None,
 ):
     """
     Activates full disk offload for a model. As a result, all parameters of the model will be offloaded as
@@ -136,7 +156,14 @@ def disk_offload(
             model's first parameter device.
         offload_buffers (`bool`, *optional*, defaults to `False`):
             Whether or not to offload the buffers with the model parameters.
+        preload_module_classes (`List[str]`, *optional*):
+            A list of classes whose instances should load all their weights (even in the submodules) at the beginning
+            of the forward. This should only be used for classes that have submodules which are registered but not
+            called directly during the forward, for instance if a `dense` linear layer is registered, but at forward,
+            `dense.weight` and `dense.bias` are used in some operations instead of calling `dense` directly.
     """
+    if not is_torch_version(">=", "1.9.0"):
+        raise NotImplementedError("Disk offloading requires torch >= 1.9.0")
     if not os.path.isdir(offload_dir) or not os.path.isfile(os.path.join(offload_dir, "index.json")):
         offload_state_dict(offload_dir, model.state_dict())
     if execution_device is None:
@@ -148,6 +175,7 @@ def disk_offload(
         offload=True,
         offload_buffers=offload_buffers,
         weights_map=weights_map,
+        preload_module_classes=preload_module_classes,
     )
     add_hook_to_module(model, AlignDevicesHook(io_same_device=True))
     return model
@@ -160,6 +188,7 @@ def dispatch_model(
     state_dict: Optional[Dict[str, torch.Tensor]] = None,
     offload_dir: Union[str, os.PathLike] = None,
     offload_buffers: bool = False,
+    preload_module_classes: Optional[List[str]] = None,
 ):
     """
     Dispatches a model according to a given device map. Layers of the model might be spread across GPUs, offloaded on
@@ -180,7 +209,14 @@ def dispatch_model(
             The folder in which to offload the model weights (or where the model weights are already offloaded).
         offload_buffers (`bool`, *optional*, defaults to `False`):
             Whether or not to offload the buffers with the model parameters.
+        preload_module_classes (`List[str]`, *optional*):
+            A list of classes whose instances should load all their weights (even in the submodules) at the beginning
+            of the forward. This should only be used for classes that have submodules which are registered but not
+            called directly during the forward, for instance if a `dense` linear layer is registered, but at forward,
+            `dense.weight` and `dense.bias` are used in some operations instead of calling `dense` directly.
     """
+    if not is_torch_version(">=", "1.9.0"):
+        raise NotImplementedError("Model dispatching requires torch >= 1.9.0")
     # Error early if the device map is incomplete.
     check_device_map(model, device_map)
 
@@ -219,6 +255,7 @@ def dispatch_model(
         offload=offload,
         offload_buffers=offload_buffers,
         weights_map=weights_map,
+        preload_module_classes=preload_module_classes,
     )
     model.hf_device_map = device_map
     return model
@@ -233,7 +270,8 @@ def load_checkpoint_and_dispatch(
     offload_folder: Optional[Union[str, os.PathLike]] = None,
     offload_buffers: bool = False,
     dtype: Optional[Union[str, torch.dtype]] = None,
-    offload_state_dict: bool = False,
+    offload_state_dict: Optional[bool] = None,
+    preload_module_classes: Optional[List[str]] = None,
 ):
     """
     Loads a (potentially sharded) checkpoint inside a model, potentially sending weights to a given device as they are
@@ -250,7 +288,8 @@ def load_checkpoint_and_dispatch(
             A map that specifies where each submodule should go. It doesn't need to be refined to each parameter/buffer
             name, once a given module name is inside, every submodule of it will be sent to the same device.
 
-            To have Accelerate compute the most optimized `device_map` automatically, set `device_map="auto"`.
+            To have Accelerate compute the most optimized `device_map` automatically, set `device_map="auto"`. For more
+            information about each option see [here](big_modeling#designing-a-device-map).
         max_memory (`Dict`, *optional*):
             A dictionary device identifier to maximum memory. Will default to the maximum memory available for each GPU
             and the available CPU RAM if unset.
@@ -264,14 +303,37 @@ def load_checkpoint_and_dispatch(
             well as the parameters.
         dtype (`str` or `torch.dtype`, *optional*):
             If provided, the weights will be converted to that type when loaded.
-        offload_state_dict (`bool`, *optional*, defaults to `False`):
+        offload_state_dict (`bool`, *optional*):
             If `True`, will temporarily offload the CPU state dict on the hard drive to avoig getting out of CPU RAM if
-            the weight of the CPU state dict + the biggest shard does not fit.
+            the weight of the CPU state dict + the biggest shard does not fit. Will default to `True` if the device map
+            picked contains `"disk"` values.
+        preload_module_classes (`List[str]`, *optional*):
+            A list of classes whose instances should load all their weights (even in the submodules) at the beginning
+            of the forward. This should only be used for classes that have submodules which are registered but not
+            called directly during the forward, for instance if a `dense` linear layer is registered, but at forward,
+            `dense.weight` and `dense.bias` are used in some operations instead of calling `dense` directly.
     """
-    if device_map == "auto":
+    if not is_torch_version(">=", "1.9.0"):
+        raise NotImplementedError("Loading and dispatching requires torch >= 1.9.0")
+    if isinstance(device_map, str) and device_map not in ["auto", "balanced", "balanced_low_0", "sequential"]:
+        raise ValueError(
+            "If passing a string for `device_map`, please choose 'auto', 'balanced', 'balanced_low_0' or "
+            "'sequential'."
+        )
+    if device_map != "sequential":
+        max_memory = get_balanced_memory(
+            model,
+            max_memory=max_memory,
+            no_split_module_classes=no_split_module_classes,
+            dtype=dtype,
+            low_zero=(device_map == "balanced_low_0"),
+        )
+    if isinstance(device_map, str):
         device_map = infer_auto_device_map(
             model, max_memory=max_memory, no_split_module_classes=no_split_module_classes, dtype=dtype
         )
+    if offload_state_dict is None and "disk" in device_map.values():
+        offload_state_dict = True
     load_checkpoint_in_model(
         model,
         checkpoint,
@@ -282,4 +344,10 @@ def load_checkpoint_and_dispatch(
     )
     if device_map is None:
         return model
-    return dispatch_model(model, device_map=device_map, offload_dir=offload_folder, offload_buffers=offload_buffers)
+    return dispatch_model(
+        model,
+        device_map=device_map,
+        offload_dir=offload_folder,
+        offload_buffers=offload_buffers,
+        preload_module_classes=preload_module_classes,
+    )

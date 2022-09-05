@@ -16,23 +16,15 @@ from setuptools import setup
 from setuptools import find_packages
 
 extras = {}
-extras["quality"] = ["black ~= 22.0", "isort >= 5.5.4", "flake8 >= 3.8.3"]
+extras["quality"] = ["black ~= 22.0", "isort >= 5.5.4", "flake8 >= 3.8.3", "hf-doc-builder >= 0.3.0"]
 extras["docs"] = []
-extras["test"] = [
-    "pytest",
-    "pytest-xdist",
-    "pytest-subtests",
-    "datasets",
-    "evaluate",
-    "transformers",
-    "scipy",
-    "sklearn",
-    "parameterized",
-    "deepspeed",
-]
+extras["test_prod"] = ["pytest", "pytest-xdist", "pytest-subtests", "parameterized"]
+extras["test_dev"] = ["datasets", "evaluate", "transformers", "scipy", "sklearn", "deepspeed<0.7.0", "tqdm"]
+extras["testing"] = extras["test_prod"] + extras["test_dev"]
+extras["rich"] = ["rich"]
 
 extras["test_trackers"] = ["wandb", "comet-ml", "tensorboard"]
-extras["dev"] = extras["quality"] + extras["test"]
+extras["dev"] = extras["quality"] + extras["testing"] + extras["rich"]
 
 extras["sagemaker"] = [
     "sagemaker",  # boto3 is a required package in sagemaker
@@ -40,7 +32,7 @@ extras["sagemaker"] = [
 
 setup(
     name="accelerate",
-    version="0.10.0",
+    version="0.13.0.dev0",
     description="Accelerate",
     long_description=open("README.md", "r", encoding="utf-8").read(),
     long_description_content_type="text/markdown",

@@ -2,7 +2,7 @@
 # There's no way to ignore "F401 '...' imported but unused" warnings in this
 # module, but to preserve other warnings. So, don't check this module at all
 
-from .constants import MODEL_NAME, OPTIMIZER_NAME, RNG_STATE_NAME, SCALER_NAME, SCHEDULER_NAME
+from .constants import MODEL_NAME, OPTIMIZER_NAME, RNG_STATE_NAME, SCALER_NAME, SCHEDULER_NAME, TORCH_LAUNCH_PARAMS
 from .dataclasses import (
     ComputeEnvironment,
     DeepSpeedPlugin,
@@ -19,11 +19,16 @@ from .dataclasses import (
     TensorInformation,
 )
 from .imports import (
+    get_ccl_version,
+    is_aim_available,
     is_apex_available,
+    is_bf16_available,
     is_boto3_available,
     is_ccl_available,
     is_comet_ml_available,
+    is_datasets_available,
     is_deepspeed_available,
+    is_rich_available,
     is_sagemaker_available,
     is_tensorboard_available,
     is_tpu_available,
@@ -36,6 +41,7 @@ from .modeling import (
     convert_file_size_to_int,
     dtype_byte_size,
     find_tied_parameters,
+    get_balanced_memory,
     get_max_layer_size,
     get_max_memory,
     infer_auto_device_map,
@@ -48,6 +54,7 @@ from .offload import (
     OffloadedWeightsLoader,
     PrefixedDataset,
     extract_submodules_state_dict,
+    load_offloaded_weight,
     offload_state_dict,
     offload_weight,
     save_offload_index,
@@ -86,7 +93,7 @@ if is_deepspeed_available():
         HfDeepSpeedConfig,
     )
 
-from .launch import PrepareForLaunch, get_launch_prefix
+from .launch import PrepareForLaunch, _filter_args, get_launch_prefix
 from .memory import find_executable_batch_size
 from .other import (
     extract_model_from_parallel,
@@ -97,3 +104,4 @@ from .other import (
     write_basic_config,
 )
 from .random import set_seed, synchronize_rng_state, synchronize_rng_states
+from .tqdm import tqdm

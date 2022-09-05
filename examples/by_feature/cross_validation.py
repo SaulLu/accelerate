@@ -17,6 +17,7 @@ from typing import List
 
 import numpy as np
 import torch
+from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 import evaluate
@@ -26,13 +27,7 @@ from datasets import DatasetDict, load_dataset
 # New Code #
 # We'll be using StratifiedKFold for this example
 from sklearn.model_selection import StratifiedKFold
-from transformers import (
-    AdamW,
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    get_linear_schedule_with_warmup,
-    set_seed,
-)
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup, set_seed
 
 
 ########################################################################
@@ -97,11 +92,13 @@ def get_fold_dataloaders(
         return outputs
 
     # Apply the method we just defined to all the examples in all the splits of the dataset
-    tokenized_datasets = datasets.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=["idx", "sentence1", "sentence2"],
-    )
+    # starting with the main process first:
+    with accelerator.main_process_first():
+        tokenized_datasets = datasets.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=["idx", "sentence1", "sentence2"],
+        )
 
     # We also rename the 'label' column to 'labels' which is the expected name for labels by the models of the
     # transformers library
@@ -130,7 +127,6 @@ def get_fold_dataloaders(
 
 def training_function(config, args):
     # New Code #
-    test_labels = None
     test_predictions = []
     # Download the dataset
     datasets = load_dataset("glue", "mrpc")
@@ -141,7 +137,6 @@ def training_function(config, args):
     # Sample hyper-parameters for learning rate, batch size, seed and a few other HPs
     lr = config["lr"]
     num_epochs = int(config["num_epochs"])
-    correct_bias = config["correct_bias"]
     seed = int(config["seed"])
     batch_size = int(config["batch_size"])
 
@@ -149,7 +144,7 @@ def training_function(config, args):
 
     # If the batch size is too big we use gradient accumulation
     gradient_accumulation_steps = 1
-    if batch_size > MAX_GPU_BATCH_SIZE:
+    if batch_size > MAX_GPU_BATCH_SIZE and accelerator.distributed_type != DistributedType.TPU:
         gradient_accumulation_steps = batch_size // MAX_GPU_BATCH_SIZE
         batch_size = MAX_GPU_BATCH_SIZE
 
@@ -158,17 +153,15 @@ def training_function(config, args):
     # New Code #
     # Create our folds:
     folds = kfold.split(np.zeros(datasets["train"].num_rows), datasets["train"]["label"])
-
+    test_references = []
     # Iterate over them
-    for train_idxs, valid_idxs in folds:
+    for i, (train_idxs, valid_idxs) in enumerate(folds):
         train_dataloader, eval_dataloader, test_dataloader = get_fold_dataloaders(
             accelerator,
             datasets,
             train_idxs,
             valid_idxs,
         )
-        if test_labels is None:
-            test_labels = datasets["validation"]["label"]
         # Instantiate the model (we build the model here so that the seed also control new weights initialization)
         model = AutoModelForSequenceClassification.from_pretrained("bert-base-cased", return_dict=True)
 
@@ -178,7 +171,7 @@ def training_function(config, args):
         model = model.to(accelerator.device)
 
         # Instantiate optimizer
-        optimizer = AdamW(params=model.parameters(), lr=lr, correct_bias=correct_bias)
+        optimizer = AdamW(params=model.parameters(), lr=lr)
 
         # Instantiate scheduler
         lr_scheduler = get_linear_schedule_with_warmup(
@@ -216,7 +209,7 @@ def training_function(config, args):
                 with torch.no_grad():
                     outputs = model(**batch)
                 predictions = outputs.logits.argmax(dim=-1)
-                predictions, references = accelerator.gather((predictions, batch["labels"]))
+                predictions, references = accelerator.gather_for_metrics((predictions, batch["labels"]))
                 metric.add_batch(
                     predictions=predictions,
                     references=references,
@@ -235,21 +228,20 @@ def training_function(config, args):
             with torch.no_grad():
                 outputs = model(**batch)
             predictions = outputs.logits
-            predictions, references = accelerator.gather((predictions, batch["labels"]))
+            predictions, references = accelerator.gather_for_metrics((predictions, batch["labels"]))
             fold_predictions.append(predictions.cpu())
-            metric.add_batch(
-                predictions=predictions.argmax(dim=-1),
-                references=references,
-            )
-        test_metric = metric.compute()
+            if i == 0:
+                # We need all of the test predictions
+                test_references.append(references.cpu())
         # Use accelerator.print to print only on the main process.
         test_predictions.append(torch.cat(fold_predictions, dim=0))
         # We now need to release all our memory and get rid of the current model, optimizer, etc
         accelerator.free_memory()
     # New Code #
     # Finally we check the accuracy of our folded results:
-    preds = torch.stack(test_predictions, dim=0).sum(dim=0).div(int(config["n_splits"])).argmax(dim=-1)
-    test_metric = metric.compute(predictions=preds, references=test_labels)
+    test_references = torch.cat(test_references, dim=0)
+    preds = torch.stack(test_predictions, dim=0).sum(dim=0).div(int(args.num_folds)).argmax(dim=-1)
+    test_metric = metric.compute(predictions=preds, references=test_references)
     accelerator.print("Average test metrics from all folds:", test_metric)
 
 
@@ -268,7 +260,7 @@ def main():
     # New Code #
     parser.add_argument("--num_folds", type=int, default=3, help="The number of splits to perform across the dataset")
     args = parser.parse_args()
-    config = {"lr": 2e-5, "num_epochs": 3, "correct_bias": True, "seed": 42, "batch_size": 16}
+    config = {"lr": 2e-5, "num_epochs": 3, "seed": 42, "batch_size": 16}
     training_function(config, args)
 
 

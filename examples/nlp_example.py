@@ -15,18 +15,13 @@
 import argparse
 
 import torch
+from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 import evaluate
 from accelerate import Accelerator, DistributedType
 from datasets import load_dataset
-from transformers import (
-    AdamW,
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    get_linear_schedule_with_warmup,
-    set_seed,
-)
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup, set_seed
 
 
 ########################################################################
@@ -70,11 +65,13 @@ def get_dataloaders(accelerator: Accelerator, batch_size: int = 16):
         return outputs
 
     # Apply the method we just defined to all the examples in all the splits of the dataset
-    tokenized_datasets = datasets.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=["idx", "sentence1", "sentence2"],
-    )
+    # starting with the main process first:
+    with accelerator.main_process_first():
+        tokenized_datasets = datasets.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=["idx", "sentence1", "sentence2"],
+        )
 
     # We also rename the 'label' column to 'labels' which is the expected name for labels by the models of the
     # transformers library
@@ -103,7 +100,6 @@ def training_function(config, args):
     # Sample hyper-parameters for learning rate, batch size, seed and a few other HPs
     lr = config["lr"]
     num_epochs = int(config["num_epochs"])
-    correct_bias = config["correct_bias"]
     seed = int(config["seed"])
     batch_size = int(config["batch_size"])
 
@@ -111,7 +107,7 @@ def training_function(config, args):
 
     # If the batch size is too big we use gradient accumulation
     gradient_accumulation_steps = 1
-    if batch_size > MAX_GPU_BATCH_SIZE:
+    if batch_size > MAX_GPU_BATCH_SIZE and accelerator.distributed_type != DistributedType.TPU:
         gradient_accumulation_steps = batch_size // MAX_GPU_BATCH_SIZE
         batch_size = MAX_GPU_BATCH_SIZE
 
@@ -126,7 +122,7 @@ def training_function(config, args):
     model = model.to(accelerator.device)
 
     # Instantiate optimizer
-    optimizer = AdamW(params=model.parameters(), lr=lr, correct_bias=correct_bias)
+    optimizer = AdamW(params=model.parameters(), lr=lr)
 
     # Instantiate scheduler
     lr_scheduler = get_linear_schedule_with_warmup(
@@ -164,7 +160,7 @@ def training_function(config, args):
             with torch.no_grad():
                 outputs = model(**batch)
             predictions = outputs.logits.argmax(dim=-1)
-            predictions, references = accelerator.gather((predictions, batch["labels"]))
+            predictions, references = accelerator.gather_for_metrics((predictions, batch["labels"]))
             metric.add_batch(
                 predictions=predictions,
                 references=references,
@@ -188,7 +184,7 @@ def main():
     )
     parser.add_argument("--cpu", action="store_true", help="If passed, will train on the CPU.")
     args = parser.parse_args()
-    config = {"lr": 2e-5, "num_epochs": 3, "correct_bias": True, "seed": 42, "batch_size": 16}
+    config = {"lr": 2e-5, "num_epochs": 3, "seed": 42, "batch_size": 16}
     training_function(config, args)
 
 

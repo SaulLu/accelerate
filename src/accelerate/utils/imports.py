@@ -14,6 +14,11 @@
 
 import importlib
 import sys
+from functools import lru_cache
+
+import torch
+
+from .versions import is_torch_version
 
 
 # The package importlib_metadata is in a different place, depending on the Python version.
@@ -21,14 +26,6 @@ if sys.version_info < (3, 8):
     import importlib_metadata
 else:
     import importlib.metadata as importlib_metadata
-
-
-try:
-    import torch_ccl  # noqa: F401
-
-    _ccl_available = True
-except ImportError:
-    _ccl_available = False
 
 
 try:
@@ -40,14 +37,30 @@ except ImportError:
 
 
 def is_ccl_available():
-    return _ccl_available
+    return (
+        importlib.util.find_spec("torch_ccl") is not None
+        or importlib.util.find_spec("oneccl_bindings_for_pytorch") is not None
+    )
+
+
+def get_ccl_version():
+    return importlib_metadata.version("oneccl_bind_pt")
 
 
 def is_apex_available():
     return importlib.util.find_spec("apex") is not None
 
 
-def is_tpu_available():
+@lru_cache()
+def is_tpu_available(check_device=True):
+    "Checks if `torch_xla` is installed and potentially if a TPU is in the environment"
+    if _tpu_available and check_device:
+        try:
+            # Will raise a RuntimeError if no XLA configuration is found
+            _ = xm.xla_device()
+            return True
+        except RuntimeError:
+            return False
     return _tpu_available
 
 
@@ -63,8 +76,27 @@ def is_deepspeed_available():
             return False
 
 
+def is_bf16_available(ignore_tpu=False):
+    "Checks if bf16 is supported, optionally ignoring the TPU"
+    if is_tpu_available():
+        return not ignore_tpu
+    if is_torch_version(">=", "1.10"):
+        if torch.cuda.is_available():
+            return torch.cuda.is_bf16_supported()
+        return True
+    return False
+
+
 def is_transformers_available():
     return importlib.util.find_spec("transformers") is not None
+
+
+def is_datasets_available():
+    return importlib.util.find_spec("datasets") is not None
+
+
+def is_aim_available():
+    return importlib.util.find_spec("aim") is not None
 
 
 def is_tensorboard_available():
@@ -83,5 +115,13 @@ def is_boto3_available():
     return importlib.util.find_spec("boto3") is not None
 
 
+def is_rich_available():
+    return importlib.util.find_spec("rich") is not None
+
+
 def is_sagemaker_available():
     return importlib.util.find_spec("sagemaker") is not None
+
+
+def is_tqdm_available():
+    return importlib.util.find_spec("tqdm") is not None

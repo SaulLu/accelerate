@@ -16,18 +16,13 @@ import argparse
 import os
 
 import torch
+from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 import evaluate
 from accelerate import Accelerator, DistributedType
 from datasets import load_dataset
-from transformers import (
-    AdamW,
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    get_linear_schedule_with_warmup,
-    set_seed,
-)
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup, set_seed
 
 
 ########################################################################
@@ -72,11 +67,13 @@ def get_dataloaders(accelerator: Accelerator, batch_size: int = 16):
         return outputs
 
     # Apply the method we just defined to all the examples in all the splits of the dataset
-    tokenized_datasets = datasets.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=["idx", "sentence1", "sentence2"],
-    )
+    # starting with the main process first:
+    with accelerator.main_process_first():
+        tokenized_datasets = datasets.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=["idx", "sentence1", "sentence2"],
+        )
 
     # We also rename the 'label' column to 'labels' which is the expected name for labels by the models of the
     # transformers library
@@ -107,16 +104,24 @@ if os.environ.get("TESTING_MOCKED_DATALOADERS", None) == "1":
 
 
 def training_function(config, args):
+    # For testing only
+    if os.environ.get("TESTING_MOCKED_DATALOADERS", None) == "1":
+        config["num_epochs"] = 2
+    # New Code #
+    gradient_accumulation_steps = int(args.gradient_accumulation_steps)
     # Initialize accelerator
-    accelerator = Accelerator(cpu=args.cpu, mixed_precision=args.mixed_precision)
+    accelerator = Accelerator(
+        cpu=args.cpu, mixed_precision=args.mixed_precision, gradient_accumulation_steps=gradient_accumulation_steps
+    )
+    if accelerator.distributed_type == DistributedType.TPU and gradient_accumulation_steps > 1:
+        raise NotImplementedError(
+            "Gradient accumulation on TPUs is currently not supported. Pass `gradient_accumulation_steps=1`"
+        )
     # Sample hyper-parameters for learning rate, batch size, seed and a few other HPs
     lr = config["lr"]
     num_epochs = int(config["num_epochs"])
-    correct_bias = config["correct_bias"]
     seed = int(config["seed"])
     batch_size = int(config["batch_size"])
-    # New Code #
-    gradient_accumulation_steps = int(args.gradient_accumulation_steps)
 
     metric = evaluate.load("glue", "mrpc")
 
@@ -131,13 +136,13 @@ def training_function(config, args):
     model = model.to(accelerator.device)
 
     # Instantiate optimizer
-    optimizer = AdamW(params=model.parameters(), lr=lr, correct_bias=correct_bias)
+    optimizer = AdamW(params=model.parameters(), lr=lr)
 
     # Instantiate scheduler
     lr_scheduler = get_linear_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=100,
-        num_training_steps=(len(train_dataloader) * num_epochs) // gradient_accumulation_steps,
+        num_training_steps=(len(train_dataloader) * num_epochs),
     )
 
     # Prepare everything
@@ -154,19 +159,11 @@ def training_function(config, args):
             # We could avoid this line since we set the accelerator with `device_placement=True`.
             batch.to(accelerator.device)
             # New code #
-            # We use the new `no_sync` context manager to prevent gradient averaging
-            # until we want to at the proper step if we happen to be in a distributed setup
-            # otherwise it does nothing
-            if step % gradient_accumulation_steps == 0:
-                # Accumulate gradients locally
-                with accelerator.no_sync(model):
-                    output = model(**batch)
-                    loss = output.loss / gradient_accumulation_steps
-                    accelerator.backward(loss)
-            else:
-                # Sync gradients and step
+            # We use the new `accumulate` context manager to perform gradient accumulation
+            # We also currently do not support TPUs nor advise it as bugs were found on the XLA side when running our tests.
+            with accelerator.accumulate(model):
                 output = model(**batch)
-                loss = output.loss / gradient_accumulation_steps
+                loss = output.loss
                 accelerator.backward(loss)
                 optimizer.step()
                 lr_scheduler.step()
@@ -179,7 +176,7 @@ def training_function(config, args):
             with torch.no_grad():
                 outputs = model(**batch)
             predictions = outputs.logits.argmax(dim=-1)
-            predictions, references = accelerator.gather((predictions, batch["labels"]))
+            predictions, references = accelerator.gather_for_metrics((predictions, batch["labels"]))
             metric.add_batch(
                 predictions=predictions,
                 references=references,
@@ -210,7 +207,7 @@ def main():
     )
     parser.add_argument("--cpu", action="store_true", help="If passed, will train on the CPU.")
     args = parser.parse_args()
-    config = {"lr": 2e-5, "num_epochs": 3, "correct_bias": True, "seed": 42, "batch_size": 16}
+    config = {"lr": 2e-5, "num_epochs": 3, "seed": 42, "batch_size": 16}
     training_function(config, args)
 
 

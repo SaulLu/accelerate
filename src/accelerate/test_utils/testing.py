@@ -15,10 +15,12 @@
 import asyncio
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
 from distutils.util import strtobool
+from functools import partial
 from pathlib import Path
 from typing import List, Union
 from unittest import mock
@@ -29,9 +31,12 @@ from ..state import AcceleratorState
 from ..utils import (
     gather,
     is_comet_ml_available,
+    is_datasets_available,
     is_deepspeed_available,
     is_tensorboard_available,
+    is_torch_version,
     is_tpu_available,
+    is_transformers_available,
     is_wandb_available,
 )
 
@@ -55,6 +60,11 @@ def parse_flag_from_env(key, default=False):
 _run_slow_tests = parse_flag_from_env("RUN_SLOW", default=False)
 
 
+def skip(test_case):
+    "Decorator that skips a test unconditionally"
+    return unittest.skip("Test was skipped")(test_case)
+
+
 def slow(test_case):
     """
     Decorator marking a test as slow. Slow tests are skipped by default. Set the RUN_SLOW environment variable to a
@@ -75,6 +85,15 @@ def require_cuda(test_case):
     Decorator marking a test that requires CUDA. These tests are skipped when there are no GPU available.
     """
     return unittest.skipUnless(torch.cuda.is_available(), "test requires a GPU")(test_case)
+
+
+def require_huggingface_suite(test_case):
+    """
+    Decorator marking a test that requires transformers and datasets. These tests are skipped when they are not.
+    """
+    return unittest.skipUnless(
+        is_transformers_available() and is_datasets_available(), "test requires the Hugging Face suite"
+    )(test_case)
 
 
 def require_tpu(test_case):
@@ -107,6 +126,23 @@ def require_deepspeed(test_case):
     return unittest.skipUnless(is_deepspeed_available(), "test requires DeepSpeed")(test_case)
 
 
+def require_fsdp(test_case):
+    """
+    Decorator marking a test that requires FSDP installed. These tests are skipped when FSDP isn't installed
+    """
+    return unittest.skipUnless(is_torch_version(">=", "1.12.0"), "test requires torch version >= 1.12.0")(test_case)
+
+
+def require_torch_min_version(test_case=None, version=None):
+    """
+    Decorator marking that a test requires a particular torch version to be tested. These tests are skipped when an
+    installed torch version is less than the required one.
+    """
+    if test_case is None:
+        return partial(require_torch_min_version, version=version)
+    return unittest.skipUnless(is_torch_version(">=", version), f"test requires torch version >= {version}")(test_case)
+
+
 def require_tensorboard(test_case):
     """
     Decorator marking a test that requires tensorboard installed. These tests are skipped when tensorboard isn't
@@ -127,6 +163,22 @@ def require_comet_ml(test_case):
     Decorator marking a test that requires comet_ml installed. These tests are skipped when comet_ml isn't installed
     """
     return unittest.skipUnless(is_comet_ml_available(), "test requires comet_ml")(test_case)
+
+
+_atleast_one_tracker_available = (
+    any([is_wandb_available(), is_tensorboard_available()]) and not is_comet_ml_available()
+)
+
+
+def require_trackers(test_case):
+    """
+    Decorator marking that a test requires at least one tracking library installed. These tests are skipped when none
+    are installed
+    """
+    return unittest.skipUnless(
+        _atleast_one_tracker_available,
+        "test requires at least one tracker to be available and for `comet_ml` to not be installed",
+    )(test_case)
 
 
 class TempDirTestCase(unittest.TestCase):
@@ -279,3 +331,24 @@ def execute_subprocess_async(cmd, env=None, stdin=None, timeout=180, quiet=False
         )
 
     return result
+
+
+class SubprocessCallException(Exception):
+    pass
+
+
+def run_command(command: List[str], return_stdout=False):
+    """
+    Runs `command` with `subprocess.check_output` and will potentially return the `stdout`. Will also properly capture
+    if an error occured while running `command`
+    """
+    try:
+        output = subprocess.check_output(command, stderr=subprocess.STDOUT)
+        if return_stdout:
+            if hasattr(output, "decode"):
+                output = output.decode("utf-8")
+            return output
+    except subprocess.CalledProcessError as e:
+        raise SubprocessCallException(
+            f"Command `{' '.join(command)}` failed with the following error:\n\n{e.output.decode()}"
+        ) from e

@@ -16,18 +16,13 @@ import argparse
 import os
 
 import torch
+from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 import evaluate
 from accelerate import Accelerator, DistributedType
 from datasets import load_dataset
-from transformers import (
-    AdamW,
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    get_linear_schedule_with_warmup,
-    set_seed,
-)
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup, set_seed
 
 
 ########################################################################
@@ -77,11 +72,13 @@ def get_dataloaders(accelerator: Accelerator, batch_size: int = 16):
         return outputs
 
     # Apply the method we just defined to all the examples in all the splits of the dataset
-    tokenized_datasets = datasets.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=["idx", "sentence1", "sentence2"],
-    )
+    # starting with the main process first:
+    with accelerator.main_process_first():
+        tokenized_datasets = datasets.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=["idx", "sentence1", "sentence2"],
+        )
 
     # We also rename the 'label' column to 'labels' which is the expected name for labels by the models of the
     # transformers library
@@ -112,6 +109,9 @@ if os.environ.get("TESTING_MOCKED_DATALOADERS", None) == "1":
 
 
 def training_function(config, args):
+    # For testing only
+    if os.environ.get("TESTING_MOCKED_DATALOADERS", None) == "1":
+        config["num_epochs"] = 2
     # Initialize Accelerator
 
     # New Code #
@@ -127,7 +127,6 @@ def training_function(config, args):
     # Sample hyper-parameters for learning rate, batch size, seed and a few other HPs
     lr = config["lr"]
     num_epochs = int(config["num_epochs"])
-    correct_bias = config["correct_bias"]
     seed = int(config["seed"])
     batch_size = int(config["batch_size"])
     set_seed(seed)
@@ -137,7 +136,7 @@ def training_function(config, args):
 
     # If the batch size is too big we use gradient accumulation
     gradient_accumulation_steps = 1
-    if batch_size > MAX_GPU_BATCH_SIZE:
+    if batch_size > MAX_GPU_BATCH_SIZE and accelerator.distributed_type != DistributedType.TPU:
         gradient_accumulation_steps = batch_size // MAX_GPU_BATCH_SIZE
         batch_size = MAX_GPU_BATCH_SIZE
 
@@ -150,7 +149,7 @@ def training_function(config, args):
     model = model.to(accelerator.device)
 
     # Instantiate optimizer
-    optimizer = AdamW(params=model.parameters(), lr=lr, correct_bias=correct_bias)
+    optimizer = AdamW(params=model.parameters(), lr=lr)
 
     # Instantiate scheduler
     lr_scheduler = get_linear_schedule_with_warmup(
@@ -167,13 +166,10 @@ def training_function(config, args):
     )
 
     # New Code #
-    # We need to initalize the trackers we use. Overall configurations can also be stored
+    # We need to initialize the trackers we use. Overall configurations can also be stored
     if args.with_tracking:
-        if accelerator.is_main_process:
-            run = os.path.split(__file__)[-1].split(".")[0]
-            if args.logging_dir:
-                run = os.path.join(args.logging_dir, run)
-            accelerator.init_trackers(run, config)
+        run = os.path.split(__file__)[-1].split(".")[0]
+        accelerator.init_trackers(run, config)
 
     # Now we train the model
     for epoch in range(num_epochs):
@@ -204,8 +200,7 @@ def training_function(config, args):
             with torch.no_grad():
                 outputs = model(**batch)
             predictions = outputs.logits.argmax(dim=-1)
-            # It is slightly faster to call this once, than multiple times
-            predictions, references = accelerator.gather((predictions, batch["labels"]))
+            predictions, references = accelerator.gather_for_metrics((predictions, batch["labels"]))
             metric.add_batch(
                 predictions=predictions,
                 references=references,
@@ -260,7 +255,7 @@ def main():
         help="Location on where to store experiment tracking logs`",
     )
     args = parser.parse_args()
-    config = {"lr": 2e-5, "num_epochs": 3, "correct_bias": True, "seed": 42, "batch_size": 16}
+    config = {"lr": 2e-5, "num_epochs": 3, "seed": 42, "batch_size": 16}
     training_function(config, args)
 
 

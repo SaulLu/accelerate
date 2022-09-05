@@ -16,18 +16,13 @@ import argparse
 import os
 
 import torch
+from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 import evaluate
 from accelerate import Accelerator, DistributedType
 from datasets import load_dataset
-from transformers import (
-    AdamW,
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    get_linear_schedule_with_warmup,
-    set_seed,
-)
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup, set_seed
 
 
 ########################################################################
@@ -76,17 +71,13 @@ def training_function(config, args):
     # Sample hyper-parameters for learning rate, batch size, seed and a few other HPs
     lr = config["lr"]
     num_epochs = int(config["num_epochs"])
-    correct_bias = config["correct_bias"]
     seed = int(config["seed"])
     batch_size = int(config["batch_size"])
 
     # We need to initialize the trackers we use, and also store our configuration
     if args.with_tracking:
-        if accelerator.is_main_process:
-            run = os.path.split(__file__)[-1].split(".")[0]
-            if args.logging_dir:
-                run = os.path.join(args.logging_dir, run)
-            accelerator.init_trackers(run, config)
+        run = os.path.split(__file__)[-1].split(".")[0]
+        accelerator.init_trackers(run, config)
 
     tokenizer = AutoTokenizer.from_pretrained("bert-base-cased")
     datasets = load_dataset("glue", "mrpc")
@@ -98,11 +89,13 @@ def training_function(config, args):
         return outputs
 
     # Apply the method we just defined to all the examples in all the splits of the dataset
-    tokenized_datasets = datasets.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=["idx", "sentence1", "sentence2"],
-    )
+    # starting with the main process first:
+    with accelerator.main_process_first():
+        tokenized_datasets = datasets.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=["idx", "sentence1", "sentence2"],
+        )
 
     # We also rename the 'label' column to 'labels' which is the expected name for labels by the models of the
     # transformers library
@@ -110,7 +103,7 @@ def training_function(config, args):
 
     # If the batch size is too big we use gradient accumulation
     gradient_accumulation_steps = 1
-    if batch_size > MAX_GPU_BATCH_SIZE:
+    if batch_size > MAX_GPU_BATCH_SIZE and accelerator.distributed_type != DistributedType.TPU:
         gradient_accumulation_steps = batch_size // MAX_GPU_BATCH_SIZE
         batch_size = MAX_GPU_BATCH_SIZE
 
@@ -139,7 +132,7 @@ def training_function(config, args):
     model = model.to(accelerator.device)
 
     # Instantiate optimizer
-    optimizer = AdamW(params=model.parameters(), lr=lr, correct_bias=correct_bias)
+    optimizer = AdamW(params=model.parameters(), lr=lr)
 
     # Instantiate scheduler
     lr_scheduler = get_linear_schedule_with_warmup(
@@ -217,23 +210,13 @@ def training_function(config, args):
                     accelerator.save_state(output_dir)
 
         model.eval()
-        samples_seen = 0
         for step, batch in enumerate(eval_dataloader):
             # We could avoid this line since we set the accelerator with `device_placement=True`.
             batch.to(accelerator.device)
             with torch.no_grad():
                 outputs = model(**batch)
             predictions = outputs.logits.argmax(dim=-1)
-            # It is slightly faster to call this once, than multiple times
-            predictions, references = accelerator.gather(
-                (predictions, batch["labels"])
-            )  # If we are in a multiprocess environment, the last batch has duplicates
-            if accelerator.num_processes > 1:
-                if step == len(eval_dataloader) - 1:
-                    predictions = predictions[: len(eval_dataloader.dataset) - samples_seen]
-                    references = references[: len(eval_dataloader.dataset) - samples_seen]
-                else:
-                    samples_seen += references.shape[0]
+            predictions, references = accelerator.gather_for_metrics((predictions, batch["labels"]))
             metric.add_batch(
                 predictions=predictions,
                 references=references,
@@ -305,7 +288,7 @@ def main():
         help="Location on where to store experiment tracking logs`",
     )
     args = parser.parse_args()
-    config = {"lr": 2e-5, "num_epochs": 3, "correct_bias": True, "seed": 42, "batch_size": 16}
+    config = {"lr": 2e-5, "num_epochs": 3, "seed": 42, "batch_size": 16}
     training_function(config, args)
 
 

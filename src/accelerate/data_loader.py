@@ -18,7 +18,8 @@ from typing import List, Optional, Union
 import torch
 from torch.utils.data import BatchSampler, DataLoader, IterableDataset
 
-from .state import AcceleratorState, DistributedType, is_tpu_available
+from .logging import get_logger
+from .state import AcceleratorState, DistributedType, GradientState, is_tpu_available
 from .utils import (
     RNGType,
     broadcast,
@@ -34,9 +35,32 @@ from .utils import (
 )
 
 
-if is_tpu_available():
+if is_tpu_available(check_device=False):
     import torch_xla.distributed.parallel_loader as xpl
 
+    class MpDeviceLoaderWrapper(xpl.MpDeviceLoader):
+        """
+        Wrapper for the xpl.MpDeviceLoader class that knows the total batch size.
+
+        **Available attributes:**
+
+        - **total_batch_size** (`int`) -- Total batch size of the dataloader across all processes.
+            Equal to the original batch size when `split_batches=True`; otherwise the original batch size * the total
+            number of processes
+
+        - **total_dataset_length** (`int`) -- Total length of the inner dataset across all processes.
+        """
+
+        @property
+        def total_batch_size(self):
+            return self._loader.total_batch_size
+
+        @property
+        def total_dataset_length(self):
+            return self._loader.total_dataset_length
+
+
+logger = get_logger(__name__)
 
 # kwargs of the DataLoader in min version 1.4.0.
 _PYTORCH_DATALOADER_KWARGS = {
@@ -51,11 +75,11 @@ _PYTORCH_DATALOADER_KWARGS = {
     "timeout": 0,
     "worker_init_fn": None,
     "multiprocessing_context": None,
+    "generator": None,
 }
 
 # kwargs added after by version
 _PYTORCH_DATALOADER_ADDITIONAL_KWARGS = {
-    "1.6.0": {"generator": None},
     "1.7.0": {"prefetch_factor": 2, "persistent_workers": False},
 }
 
@@ -113,6 +137,10 @@ class BatchSamplerShard(BatchSampler):
         self.split_batches = split_batches
         self.batch_size = batch_sampler.batch_size
         self.drop_last = batch_sampler.drop_last
+
+    @property
+    def total_length(self):
+        return len(self.batch_sampler)
 
     def __len__(self):
         if self.split_batches:
@@ -287,6 +315,14 @@ class DataLoaderShard(DataLoader):
             A random number generator to keep synchronized across processes.
         kwargs:
             All other keyword arguments to pass to the regular `DataLoader` initialization.
+
+    **Available attributes:**
+
+        - **total_batch_size** (`int`) -- Total batch size of the dataloader across all processes.
+            Equal to the original batch size when `split_batches=True`; otherwise the original batch size * the total
+            number of processes
+
+        - **total_dataset_length** (`int`) -- Total length of the inner dataset across all processes.
     """
 
     def __init__(self, dataset, device=None, rng_types=None, generator=None, **kwargs):
@@ -294,34 +330,77 @@ class DataLoaderShard(DataLoader):
         self.device = device
         self.rng_types = rng_types
         self.generator = generator
+        self.gradient_state = GradientState()
 
     def __iter__(self):
         if self.rng_types is not None:
             synchronize_rng_states(self.rng_types, self.generator)
-        for batch in super().__iter__():
-            yield batch if self.device is None else send_to_device(batch, self.device)
+        self.gradient_state._set_end_of_dataloader(False)
+        try:
+            length = getattr(self.dataset, "total_dataset_length", len(self.dataset))
+            self.gradient_state._set_remainder(length % self.total_batch_size)
+        except Exception:
+            # We can safely pass because the default is -1
+            pass
+        dataloader_iter = super().__iter__()
+        # We iterate one batch ahead to check when we are at the end
+        try:
+            current_batch = next(dataloader_iter)
+        except StopIteration:
+            self.gradient_state._iterate_samples_seen(find_batch_size(current_batch))
+            yield
+        while True:
+            try:
+                # But we still move it to the device so it is done before `StopIteration` is reached
+                if self.device is not None:
+                    current_batch = send_to_device(current_batch, self.device)
+                next_batch = next(dataloader_iter)
+                yield current_batch
+                current_batch = next_batch
+            except StopIteration:
+                self.gradient_state._set_end_of_dataloader(True)
+                yield current_batch
+                break
+
+    @property
+    def total_batch_size(self):
+        return (
+            self.batch_sampler.batch_size
+            if self.batch_sampler.split_batches
+            else (self.batch_sampler.batch_size * self.batch_sampler.num_processes)
+        )
+
+    @property
+    def total_dataset_length(self):
+        if hasattr("total_length", self.dataset):
+            return self.dataset.total_length
+        else:
+            return len(self.dataset)
 
 
 class DataLoaderDispatcher(DataLoader):
     """
+    Args:
     Subclass of a PyTorch `DataLoader` that will iterate and preprocess on process 0 only, then dispatch on each
     process their part of the batch.
-
-    Args:
         split_batches (`bool`, *optional*, defaults to `False`):
             Whether the resulting `DataLoader` should split the batches of the original data loader across devices or
             yield full batches (in which case it will yield batches starting at the `process_index`-th and advancing of
-            `num_processes` batches at each iteration).
+            `num_processes` batches at each iteration). Another way to see this is that the observed batch size will be
+            the same as the initial `dataloader` if this option is set to `True`, the batch size of the initial
+            `dataloader` multiplied by `num_processes` otherwise. Setting this option to `True` requires that the batch
+            size of the `dataloader` is a round multiple of `batch_size`.
 
-            Another way to see this is that the observed batch size will be the same as the initial `dataloader` if
-            this option is set to `True`, the batch size of the initial `dataloader` multiplied by `num_processes`
-            otherwise.
+    **Available attributes:**
 
-            Setting this option to `True` requires that the batch size of the `dataloader` is a round multiple of
-            `batch_size`.
+        - **total_batch_size** (`int`) -- Total batch size of the dataloader across all processes.
+            Equal to the original batch size when `split_batches=True`; otherwise the original batch size * the total
+            number of processes
+
+        - **total_dataset_length** (`int`) -- Total length of the inner dataset across all processes.
     """
 
-    def __init__(self, dataset, split_batches: bool = False, **kwargs):
+    def __init__(self, dataset, split_batches: bool = False, _drop_last: bool = False, **kwargs):
         shuffle = False
         if is_torch_version(">=", "1.11.0"):
             from torch.utils.data.datapipes.iter.combinatorics import ShufflerIterDataPipe
@@ -333,87 +412,131 @@ class DataLoaderDispatcher(DataLoader):
         self.split_batches = split_batches
         if is_torch_version("<", "1.8.0"):
             raise ImportError(
-                "Using `DataLoaderDispatcher` requires PyTorch 1.8.0 minimum. You have {torch.__version__}."
+                f"Using `DataLoaderDispatcher` requires PyTorch 1.8.0 minimum. You have {torch.__version__}."
             )
         if shuffle:
             torch.utils.data.graph_settings.apply_shuffle_settings(dataset, shuffle=shuffle)
 
+        self.gradient_state = GradientState()
+        self.state = AcceleratorState()
+        self._drop_last = _drop_last
+        try:
+            length = getattr(self.dataset, "total_dataset_length", len(self.dataset))
+            self.gradient_state._set_remainder(length % self.total_batch_size)
+        except Exception:
+            # We can safely pass because the default is -1
+            pass
+
+    def _fetch_batches(self, iterator):
+        batches, batch = None, None
+        # On process 0, we gather the batch to dispatch.
+        if self.state.process_index == 0:
+            try:
+                if self.split_batches:
+                    # One batch of the main iterator is dispatched and split.
+                    batch = next(iterator)
+                else:
+                    # num_processes batches of the main iterator are concatenated then dispatched and split.
+                    # We add the batches one by one so we have the remainder available when drop_last=False.
+                    batches = []
+                    for _ in range(self.state.num_processes):
+                        batches.append(next(iterator))
+                    batch = concatenate(batches, dim=0)
+                # In both cases, we need to get the structure of the batch that we will broadcast on other
+                # processes to initialize the tensors with the right shape.
+                # data_structure, stop_iteration
+                batch_info = [get_data_structure(batch), False]
+            except StopIteration:
+                batch_info = [None, True]
+        else:
+            batch_info = [None, self._stop_iteration]
+        # This is inplace, so after this instruction, every process has the same `batch_info` as process 0.
+        broadcast_object_list(batch_info)
+        self._stop_iteration = batch_info[1]
+        if self._stop_iteration:
+            # If drop_last is False and split_batches is False, we may have a remainder to take care of.
+            if not self.split_batches and not self._drop_last:
+                if self.state.process_index == 0 and len(batches) > 0:
+                    batch = concatenate(batches, dim=0)
+                    batch_info = [get_data_structure(batch), False]
+                else:
+                    batch_info = [None, True]
+                broadcast_object_list(batch_info)
+                if batch_info[1]:
+                    return batch, batch_info, True
+            else:
+                return batch, batch_info, True
+        return batch, batch_info, False
+
     def __iter__(self):
-        state = AcceleratorState()
-        if state.process_index == 0:
+        self.gradient_state._set_end_of_dataloader(False)
+        main_iterator = None
+        if self.state.process_index == 0:
             # We only iterate through the DataLoader on process 0.
             main_iterator = super().__iter__()
         stop_iteration = False
+        self._stop_iteration = False
         first_batch = None
+        next_batch, next_batch_info, next_skip = self._fetch_batches(main_iterator)
         while not stop_iteration:
-            # On process 0, we gather the batch to dispatch.
-            if state.process_index == 0:
-                try:
-                    if self.split_batches:
-                        # One batch of the main iterator is dispatched and split.
-                        batch = next(main_iterator)
-                    else:
-                        # num_processes batches of the main iterator are concatenated then dispatched and split.
-                        # We add the batches one by one so we have the remainder available when drop_last=False.
-                        batches = []
-                        for _ in range(state.num_processes):
-                            batches.append(next(main_iterator))
-                        batch = concatenate(batches, dim=0)
-                    # In both cases, we need to get the structure of the batch that we will broadcast on other
-                    # processes to initialize the tensors with the right shape.
-                    # data_structure, stop_iteration
-                    batch_info = [get_data_structure(batch), False]
-                except StopIteration:
-                    batch_info = [None, True]
-            else:
-                batch_info = [None, stop_iteration]
-
-            # This is inplace, so after this instruction, every process has the same `batch_info` as process 0.
-            broadcast_object_list(batch_info)
-            stop_iteration = batch_info[1]
-            if stop_iteration:
-                # If drop_last is False and split_batches is False, we may have a remainder to take care of.
-                if not self.split_batches and not self.drop_last:
-                    if state.process_index == 0 and len(batches) > 0:
-                        batch = concatenate(batches, dim=0)
-                        batch_info = [get_data_structure(batch), False]
-                    else:
-                        batch_info = [None, True]
-                    broadcast_object_list(batch_info)
-                    if batch_info[1]:
-                        continue
-                else:
-                    continue
-
-            if state.process_index != 0:
+            batch, batch_info, skip = next_batch, next_batch_info, next_skip
+            if skip:
+                continue
+            if self.state.process_index != 0:
                 # Initialize tensors on other processes than process 0.
                 batch = initialize_tensors(batch_info[0])
-            batch = send_to_device(batch, state.device)
+            batch = send_to_device(batch, self.state.device)
             # Broadcast the batch before splitting it.
             batch = broadcast(batch, from_process=0)
 
-            if not self.drop_last and first_batch is None:
+            if not self._drop_last and first_batch is None:
                 # We keep at least num processes elements of the first batch to be able to complete the last batch
-                first_batch = slice_tensors(batch, slice(0, state.num_processes))
+                first_batch = slice_tensors(batch, slice(0, self.state.num_processes))
 
             observed_batch_size = find_batch_size(batch)
-            batch_size = observed_batch_size // state.num_processes
+            batch_size = observed_batch_size // self.state.num_processes
 
-            if not self.drop_last and stop_iteration and observed_batch_size % state.num_processes != 0:
+            stop_iteration = self._stop_iteration
+            if not stop_iteration:
+                # We may still be at the end of the dataloader without knowing it yet: if there is nothing left in
+                # the dataloader since the number of batches is a round multiple of the number of processes.
+                next_batch, next_batch_info, next_skip = self._fetch_batches(main_iterator)
+                # next_batch_info[0] is None when there are no more batches, otherwise we still need to process them.
+                if self._stop_iteration and next_batch_info[0] is None:
+                    stop_iteration = True
+
+            if not self._drop_last and stop_iteration and observed_batch_size % self.state.num_processes != 0:
                 # If the last batch is not complete, let's add the first batch to it.
                 batch = concatenate([batch, first_batch], dim=0)
+                # Batch size computation above is wrong, it's off by 1 so we fix it.
                 batch_size += 1
 
-            data_slice = slice(state.process_index * batch_size, (state.process_index + 1) * batch_size)
-            yield slice_tensors(batch, data_slice)
+            data_slice = slice(self.state.process_index * batch_size, (self.state.process_index + 1) * batch_size)
+            batch = slice_tensors(batch, data_slice)
+
+            if stop_iteration:
+                self.gradient_state._set_remainder(observed_batch_size)
+                self.gradient_state._set_end_of_dataloader(True)
+            yield batch
 
     def __len__(self):
-        state = AcceleratorState()
         whole_length = super().__len__()
-        if self.drop_last:
-            return whole_length // state.num_processes
+        if self.split_batches:
+            return whole_length
+        elif self._drop_last:
+            return whole_length // self.state.num_processes
         else:
-            return math.ceil(whole_length / state.num_processes)
+            return math.ceil(whole_length / self.state.num_processes)
+
+    @property
+    def total_batch_size(self):
+        return (
+            self.dataset.batch_size if self.split_batches else (self.dataset.batch_size * self.dataset.num_processes)
+        )
+
+    @property
+    def total_dataset_length(self):
+        return len(self.dataset)
 
 
 def prepare_data_loader(
@@ -560,7 +683,11 @@ def prepare_data_loader(
 
     if dispatch_batches:
         dataloader = DataLoaderDispatcher(
-            new_dataset, split_batches=split_batches, batch_sampler=new_batch_sampler, **kwargs
+            new_dataset,
+            split_batches=split_batches,
+            batch_sampler=new_batch_sampler,
+            _drop_last=dataloader.drop_last,
+            **kwargs,
         )
     else:
         dataloader = DataLoaderShard(
@@ -573,5 +700,5 @@ def prepare_data_loader(
         )
 
     if state.distributed_type == DistributedType.TPU:
-        return xpl.MpDeviceLoader(dataloader, device)
+        return MpDeviceLoaderWrapper(dataloader, device)
     return dataloader

@@ -1,4 +1,4 @@
-name: Self-hosted runner (scheduled)
+name: Self-hosted runner with slow tests (scheduled)
 
 on:
   workflow_dispatch:
@@ -35,6 +35,7 @@ jobs:
       - name: Run examples on GPUs
         run: |
           source activate accelerate
+          pip uninstall comet_ml -y
           make test_examples
 
   run_all_tests_multi_gpu:
@@ -56,12 +57,19 @@ jobs:
           git fetch && git checkout ${{ github.sha }}
           pip install -e . --no-deps
 
-      - name: Run test on GPUs
+      - name: Run core and big modeling tests on GPUs
         run: |
           source activate accelerate
-          make test
+          make test_big_modeling
+          make test_core
+
+      - name: Run Integration tests on GPUs
+        run: |
+          source activate accelerate
+          make test_integrations
 
       - name: Run examples on GPUs
         run: |
           source activate accelerate
+          pip uninstall comet_ml -y
           make test_examples

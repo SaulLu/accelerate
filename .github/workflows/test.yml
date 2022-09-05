@@ -11,9 +11,16 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
+        pytorch-version: [
+          latest,
+          minimum
+        ]
         test-kind: [
-          test,
+          test_prod,
+          test_core,
+          test_big_modeling,
           test_deepspeed,
+          test_fsdp,
           test_example_differences,
           test_checkpoint_step,
           test_checkpoint_epoch,
@@ -37,7 +44,10 @@ jobs:
     - name: Install the library
       run: |
         pip install --upgrade pip
-        pip install -e .[test,test_trackers]
+        if [[ ${{ matrix.test-kind }} = test_prod ]]; then pip install -e .[test_prod]; fi
+        if [[ ${{ matrix.test-kind }} != test_prod ]]; then pip install -e .[testing,test_trackers]; fi
+        if [[ ${{ matrix.test-kind }} = test_rest ]]; then pip uninstall comet_ml -y; fi
+        if [[ ${{ matrix.pytorch-version }} = minimum ]]; then pip install torch==1.6.0; fi
     
     - name: Run Tests
       run: |

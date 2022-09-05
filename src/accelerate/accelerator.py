@@ -19,6 +19,7 @@ import os
 import sys
 import warnings
 from contextlib import contextmanager
+from functools import wraps
 from typing import List, Optional, Union
 
 import torch
@@ -28,9 +29,10 @@ from .data_loader import prepare_data_loader
 from .logging import get_logger
 from .optimizer import AcceleratedOptimizer
 from .scheduler import AcceleratedScheduler
-from .state import AcceleratorState
+from .state import AcceleratorState, GradientState, parse_flag_from_env
 from .tracking import LOGGER_TYPE_TO_CLASS, GeneralTracker, filter_trackers
 from .utils import (
+    MODEL_NAME,
     DeepSpeedPlugin,
     DistributedDataParallelKwargs,
     DistributedType,
@@ -46,10 +48,12 @@ from .utils import (
     extract_model_from_parallel,
     gather,
     get_pretty_name,
+    is_bf16_available,
     is_deepspeed_available,
     is_torch_version,
     is_tpu_available,
     pad_across_processes,
+    recursively_apply,
     reduce,
     save,
     wait_for_everyone,
@@ -67,7 +71,7 @@ if is_deepspeed_available():
         DummyScheduler,
     )
 
-if is_tpu_available():
+if is_tpu_available(check_device=False):
     import torch_xla.distributed.xla_multiprocessing as xmp
 
 logger = get_logger(__name__)
@@ -91,6 +95,9 @@ class Accelerator:
             default to the value in the environment variable `MIXED_PRECISION`, which will use the default value in the
             accelerate config of the current system or the flag passed with the `accelerate.launch` command. 'fp16'
             requires pytorch 1.6 or higher. 'bf16' requires pytorch 1.10 or higher.
+        gradient_accumulation_steps (`int`, *optional*, default to 1):
+            The number of steps that should pass before gradients are accumulated. A number > 1 should be combined with
+            `Accelerator.accumulate`.
         cpu (`bool`, *optional*):
             Whether or not to force the script to execute on CPU. Will ignore GPU available if set to `True` and force
             the execution on one process only.
@@ -133,10 +140,20 @@ class Accelerator:
             A list of `KwargHandler` to customize how the objects related to distributed training or mixed precision
             are created. See [kwargs](kwargs) for more information.
 
-    Attributes
+    **Available attributes:**
 
         - **device** (`torch.device`) -- The device to use.
+        - **distributed_type** ([`~utils.DistributedType`]) -- The distributed training configuration.
+        - **local_process_index** (`int`) -- The process index on the current machine.
+        - **mixed_precision** (`str`) -- The configured mixed precision mode.
+        - **num_processes** (`int`) -- The total number of processes used for training.
+        - **optimizer_step_was_skipped** (`bool`) -- Whether or not the optimizer update was skipped (because of
+          gradient overflow in mixed precision), in which
+        case the learning rate should not be changed.
+        - **process_index** (`int`) -- The overall index of the current process among all processes.
         - **state** ([`~state.AcceleratorState`]) -- The distributed setup state.
+        - **sync_gradients** (`bool`) -- Whether the gradients are currently being synced across all processes.
+        - **use_distributed** (`bool`) -- Whether the current configuration is for distributed training.
     """
 
     def __init__(
@@ -145,6 +162,7 @@ class Accelerator:
         split_batches: bool = False,
         fp16: bool = None,
         mixed_precision: Union[PrecisionType, str] = None,
+        gradient_accumulation_steps: int = 1,
         cpu: bool = False,
         deepspeed_plugin: DeepSpeedPlugin = None,
         fsdp_plugin: FullyShardedDataParallelPlugin = None,
@@ -156,7 +174,10 @@ class Accelerator:
         kwargs_handlers: Optional[List[KwargsHandler]] = None,
     ):
         self.logging_dir = logging_dir
-        self.log_with = filter_trackers(log_with, self.logging_dir)
+        trackers = filter_trackers(log_with, self.logging_dir)
+        if len(trackers) < 1 and log_with is not None:
+            warnings.warn(f"`log_with={log_with}` was passed but no supported trackers are currently installed.")
+        self.log_with = trackers
 
         if mixed_precision is not None:
             mixed_precision = str(mixed_precision)
@@ -187,8 +208,8 @@ class Accelerator:
             deepspeed_plugin.set_deepspeed_weakref()
 
         if os.environ.get("USE_FSDP", "false") == "true" or isinstance(fsdp_plugin, FullyShardedDataParallelPlugin):
-            if is_torch_version("<", "1.12.0.dev20220418+cu113"):
-                raise ValueError("FSDP requires PyTorch >= 1.12.0.dev20220418+cu113")
+            if is_torch_version("<", "1.12.0"):
+                raise ValueError("FSDP requires PyTorch >= 1.12.0")
 
         if fsdp_plugin is None:  # init from env variables
             fsdp_plugin = FullyShardedDataParallelPlugin() if os.environ.get("USE_FSDP", "false") == "true" else None
@@ -231,6 +252,20 @@ class Accelerator:
             **kwargs,
         )
 
+        if (
+            (mixed_precision != "bf16")
+            and getattr(self.state, "downcast_bfloat", False)
+            and (self.state.distributedType != DistributedType.TPU)
+        ):
+            raise ValueError("Can only use `downcast_bf16` when using `mixed_precision='bf16'` and on a TPU")
+
+        if gradient_accumulation_steps > 1:
+            if self.state.distributed_type == DistributedType.TPU:
+                raise NotImplementedError(
+                    "Gradient accumulation on TPU is not supported. Pass in `gradient_accumulation_steps=1`"
+                )
+
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         self.device_placement = device_placement
         self.split_batches = split_batches
         self.dispatch_batches = dispatch_batches
@@ -243,20 +278,31 @@ class Accelerator:
         # Mixed precision attributes
         self.scaler = None
         self.native_amp = False
+        err = "{mode} mixed precision requires {requirement}"
         if self.state.mixed_precision == "fp16":
-            self.native_amp = is_torch_version(">=", "1.6")
-            if not self.native_amp:
-                raise ValueError("fp16 mixed precision requires PyTorch >= 1.6")
-
+            self.native_amp = True
+            if not torch.cuda.is_available() and not parse_flag_from_env("USE_MPS_DEVICE"):
+                raise ValueError(err.format(mode="fp16", requirement="a GPU"))
             kwargs = self.scaler_handler.to_kwargs() if self.scaler_handler is not None else {}
-            self.scaler = torch.cuda.amp.GradScaler(**kwargs)
-        elif self.state.mixed_precision == "bf16":
-            self.native_amp = is_torch_version(">=", "1.10")
-            if mixed_precision == "bf16" and not self.native_amp:
-                raise ValueError("bf16 mixed precision requires PyTorch >= 1.10")
+            if self.distributed_type == DistributedType.FSDP:
+                from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 
-            kwargs = self.scaler_handler.to_kwargs() if self.scaler_handler is not None else {}
-            self.scaler = torch.cuda.amp.GradScaler(**kwargs)
+                self.scaler = ShardedGradScaler(**kwargs)
+            else:
+                self.scaler = torch.cuda.amp.GradScaler(**kwargs)
+        elif self.state.mixed_precision == "bf16" and self.distributed_type != DistributedType.FSDP:
+            self.native_amp = is_bf16_available(True)
+            if mixed_precision == "bf16" and not self.native_amp and not is_tpu_available():
+                raise ValueError(err.format(mode="bf16", requirement="PyTorch >= 1.10 and a supported device."))
+
+            # Only on the GPU do we care about scaling the gradients
+            if torch.cuda.is_available() and self.device.type != "cpu":
+                kwargs = self.scaler_handler.to_kwargs() if self.scaler_handler is not None else {}
+                self.scaler = torch.cuda.amp.GradScaler(**kwargs)
+
+        # Start of internal step tracking
+        self.step = 0
+        self.gradient_state = GradientState()
 
         # Internal references to the training objects
         self._optimizers = []
@@ -267,7 +313,14 @@ class Accelerator:
         # RNG Types
         self.rng_types = rng_types
         if self.rng_types is None:
-            self.rng_types = ["torch"] if is_torch_version("<=", "1.5.1") else ["generator"]
+            self.rng_types = ["generator"]
+
+    @property
+    def use_distributed(self):
+        """
+        Whether the Accelerator is configured for distributed training
+        """
+        return self.distributed_type != DistributedType.NO and self.num_processes > 1
 
     @property
     def distributed_type(self):
@@ -317,14 +370,68 @@ class Accelerator:
             mixed_precision = self.state.mixed_precision
         return mixed_precision
 
-    @contextmanager
-    def local_main_process_first(self):
+    def on_main_process(func):
         """
-        Lets the local main process go inside a with block.
+        A decorator that will run the decorated function on the main process only.
+        """
 
-        The other processes will enter the with block after the main process exits.
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            if self.is_main_process or not self.use_distributed:
+                return func(self, *args, **kwargs)
+
+        return wrapper
+
+    def on_local_main_process(func):
         """
-        yield from self._goes_first(self.is_local_main_process)
+        A decorator that will run the decorated function on the local main process only.
+        """
+
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            if self.is_local_main_process or not self.use_distributed:
+                return func(self, *args, **kwargs)
+
+        return wrapper
+
+    def on_process(process_idx):
+        """
+        A decorator that will run the decorated function on a given process index only.
+        """
+
+        def decorator(func):
+            @wraps(func)
+            def wrapper(self, *args, **kwargs):
+                if self.process_idx == process_idx or not self.use_distributed:
+                    return func(self, *args, **kwargs)
+
+            return wrapper
+
+        return decorator
+
+    def on_local_process(local_process_idx):
+        """
+        A decorator that will run the decorated function on a given local process index only.
+        """
+
+        def decorator(func):
+            @wraps(func)
+            def wrapper(self, *args, **kwargs):
+                if self.local_process_idx == local_process_idx or not self.use_distributed:
+                    return func(self, *args, **kwargs)
+
+            return wrapper
+
+        return decorator
+
+    def _goes_first(self, is_main):
+        if not is_main:
+            self.wait_for_everyone()
+
+        yield
+
+        if is_main:
+            self.wait_for_everyone()
 
     @contextmanager
     def main_process_first(self):
@@ -335,14 +442,14 @@ class Accelerator:
         """
         yield from self._goes_first(self.is_main_process)
 
-    def _goes_first(self, is_main):
-        if not is_main:
-            self.wait_for_everyone()
+    @contextmanager
+    def local_main_process_first(self):
+        """
+        Lets the local main process go inside a with block.
 
-        yield
-
-        if is_main:
-            self.wait_for_everyone()
+        The other processes will enter the with block after the main process exits.
+        """
+        yield from self._goes_first(self.is_local_main_process)
 
     @contextmanager
     def no_sync(self, model):
@@ -355,12 +462,83 @@ class Accelerator:
         Args:
             model (`torch.nn.Module`):
                 PyTorch Module that was prepared with `Accelerator.prepare`
+
+        Example:
+
+        ```python
+        >>> from accelerate import Accelerator
+
+        >>> accelerator = Accelerator()
+        >>> dataloader, model, optimizer = accelerator.prepare(dataloader, model, optimizer)
+        >>> input_a = next(iter(dataloader))
+        >>> input_b = next(iter(dataloader))
+
+        >>> with accelerator.no_sync():
+        ...     outputs = model(input_a)
+        ...     loss = loss_func(outputs)
+        ...     accelerator.backward(loss)
+        ...     # No synchronization across processes, only accumulate gradients
+        >>> outputs = model(input_b)
+        >>> accelerator.backward(loss)
+        >>> # Synchronization across all processes
+        >>> optimizer.step()
+        >>> optimizer.zero_grad()
+        ```
         """
         context = contextlib.nullcontext
-        if self.num_processes > 1:
+        if self.use_distributed:
             context = getattr(model, "no_sync", context)
 
         with context():
+            yield
+
+    def _do_sync(self):
+        "Sets the right `sync_gradients` context and either resets or increases `self.step`"
+        if self.gradient_state.end_of_dataloader:
+            self.step = 0
+            self.gradient_state._set_sync_gradients(True)
+        else:
+            self.step += 1
+            self.gradient_state._set_sync_gradients((self.step % self.gradient_accumulation_steps) == 0)
+
+    @property
+    def sync_gradients(self):
+        return self.gradient_state.sync_gradients
+
+    @contextmanager
+    def accumulate(self, model):
+        """
+        A context manager that will lightly wrap around and perform gradient accumulation automatically
+
+        Args:
+            model (`torch.nn.Module`):
+                PyTorch Module that was prepared with `Accelerator.prepare`
+
+        Example:
+
+        ```python
+        >>> from accelerate import Accelerator
+
+        >>> accelerator = Accelerator(gradient_accumulation_steps=2)
+        >>> dataloader, model, optimizer, scheduler = accelerator.prepare(dataloader, model, optimizer, scheduler)
+
+        >>> with accelerator.accumulate():
+        ...     for input, output in dataloader:
+        ...         outputs = model(input)
+        ...         loss = loss_func(outputs)
+        ...         loss.backward()
+        ...         optimizer.step()
+        ...         scheduler.step()
+        ...         optimizer.zero_grad()
+        ```
+        """
+        self._do_sync()
+        if self.sync_gradients:
+            context = contextlib.nullcontext
+        else:
+            context = self.no_sync
+
+        with context(model):
             yield
 
     def print(self, *args, **kwargs):
@@ -372,22 +550,20 @@ class Accelerator:
 
     def _prepare_one(self, obj, first_pass=False):
         # First pass of preparation: DataLoader, model, optimizer
-        if isinstance(obj, torch.utils.data.DataLoader) and first_pass:
-            return self.prepare_data_loader(obj)
-        elif isinstance(obj, torch.nn.Module) and first_pass:
-            self._models.append(obj)
-            return self.prepare_model(obj)
-        elif isinstance(obj, torch.optim.Optimizer) and first_pass:
-            optimizer = self.prepare_optimizer(obj)
-            self._optimizers.append(optimizer)
-            return optimizer
+        if first_pass:
+            if isinstance(obj, torch.utils.data.DataLoader):
+                return self.prepare_data_loader(obj)
+            elif isinstance(obj, torch.nn.Module):
+                return self.prepare_model(obj)
+            elif isinstance(obj, torch.optim.Optimizer):
+                optimizer = self.prepare_optimizer(obj)
+                return optimizer
         # Second pass of preparation: LR scheduler (which need the full list of optimizers)
-        elif isinstance(obj, torch.optim.lr_scheduler._LRScheduler) and not first_pass:
+        elif isinstance(obj, torch.optim.lr_scheduler._LRScheduler):
             scheduler = self.prepare_scheduler(obj)
-            self._schedulers.append(scheduler)
             return scheduler
-        else:
-            return obj
+        # Return the unprocessed object if previous criteria was not met
+        return obj
 
     def _prepare_fsdp(self, *args):
         result = []
@@ -449,7 +625,8 @@ class Accelerator:
             if model_count > 1 and optimizer_present:
                 raise ValueError(
                     "For FSDP to work with multiple models (>1), "
-                    "prepare must be called for all the models before optimizers are created"
+                    "prepare must be called for all the models before optimizers are created. "
+                    "Then pass the optimizers to the prepare call in the same order as corresponding models."
                 )
             elif model_count == 1 and optimizer_present:
                 logger.warn(
@@ -499,6 +676,7 @@ class Accelerator:
         return result if len(result) > 1 else result[0]
 
     def prepare_model(self, model):
+        self._models.append(model)
         if self.device_placement and self.distributed_type != DistributedType.FSDP:
             model = model.to(self.device)
         if self.distributed_type == DistributedType.MULTI_GPU:
@@ -512,6 +690,7 @@ class Accelerator:
             # Check if the model is already a FSDP model due to `Manual Wrapping` and if so,
             # don't wrap it again
             if type(model) != FSDP:
+                self.state.fsdp_plugin.set_auto_wrap_policy(model)
                 fsdp_plugin = self.state.fsdp_plugin
                 model = FSDP(
                     model,
@@ -519,18 +698,21 @@ class Accelerator:
                     cpu_offload=fsdp_plugin.cpu_offload,
                     auto_wrap_policy=fsdp_plugin.auto_wrap_policy,
                     backward_prefetch=fsdp_plugin.backward_prefetch,
+                    mixed_precision=fsdp_plugin.mixed_precision_policy,
                     ignored_modules=fsdp_plugin.ignored_modules,
                 )
                 if not fsdp_plugin.cpu_offload.offload_params:
                     model.to(self.device)
+            self._models[-1] = model
         elif self.distributed_type == DistributedType.MULTI_CPU:
             kwargs = self.ddp_handler.to_kwargs() if self.ddp_handler is not None else {}
             model = torch.nn.parallel.DistributedDataParallel(model, **kwargs)
         if self.native_amp:
             if self.mixed_precision == "fp16" and is_torch_version(">=", "1.10"):
                 model.forward = torch.cuda.amp.autocast(dtype=torch.float16)(model.forward)
-            elif self.mixed_precision == "bf16":
-                model.forward = torch.cuda.amp.autocast(dtype=torch.bfloat16)(model.forward)
+            elif self.mixed_precision == "bf16" and self.distributed_type != DistributedType.TPU:
+                device_type = "cuda" if torch.cuda.is_available() else "cpu"
+                model.forward = torch.autocast(device_type=device_type, dtype=torch.bfloat16)(model.forward)
             else:
                 model.forward = torch.cuda.amp.autocast()(model.forward)
             model.forward = convert_outputs_to_fp32(model.forward)
@@ -708,7 +890,9 @@ class Accelerator:
         )
 
     def prepare_optimizer(self, optimizer):
-        return AcceleratedOptimizer(optimizer, device_placement=self.device_placement, scaler=self.scaler)
+        optimizer = AcceleratedOptimizer(optimizer, device_placement=self.device_placement, scaler=self.scaler)
+        self._optimizers.append(optimizer)
+        return optimizer
 
     def prepare_scheduler(self, scheduler):
         # We try to find the optimizer associated with `scheduler`, the default is the full list.
@@ -717,18 +901,23 @@ class Accelerator:
             if getattr(scheduler, "optimizer", None) == opt.optimizer:
                 optimizer = opt
                 break
-
-        return AcceleratedScheduler(
+        scheduler = AcceleratedScheduler(
             scheduler,
             optimizer,
             step_with_optimizer=self.step_scheduler_with_optimizer,
             split_batches=self.split_batches,
         )
+        self._schedulers.append(scheduler)
+        return scheduler
 
     def backward(self, loss, **kwargs):
         """
-        Use `accelerator.backward(loss)` in lieu of `loss.backward()`.
+        Scales the gradients in accordance to `Accelerator.gradient_accumulation_steps` and calls the correct
+        `backward()` based on the configuration.
+
+        Should be used in lieu of `loss.backward()`.
         """
+        loss /= self.gradient_accumulation_steps
         if self.distributed_type == DistributedType.DEEPSPEED:
             self.deepspeed_engine_wrapped.backward(loss, **kwargs)
         elif self.scaler is not None:
@@ -759,8 +948,27 @@ class Accelerator:
     def clip_grad_norm_(self, parameters, max_norm, norm_type=2):
         """
         Should be used in place of `torch.nn.utils.clip_grad_norm_`.
+
+        Example:
+
+        ```python
+        >>> from accelerate import Accelerator
+
+        >>> accelerator = Accelerator(gradient_accumulation_steps=2)
+        >>> dataloader, model, optimizer, scheduler = accelerator.prepare(dataloader, model, optimizer, scheduler)
+
+        >>> for (input, target) in dataloader:
+        ...     optimizer.zero_grad()
+        ...     output = model(input)
+        ...     loss = loss_func(output, target)
+        ...     accelerator.backward(loss)
+        ...     if accelerator.sync_gradients:
+        ...         accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
+        ...     optimizer.step()
+        ```
         """
         if self.distributed_type == DistributedType.FSDP:
+            self.unscale_gradients()
             parameters = [p for p in parameters]
             for model in self._models:
                 if parameters == [p for p in model.parameters()]:
@@ -775,6 +983,24 @@ class Accelerator:
     def clip_grad_value_(self, parameters, clip_value):
         """
         Should be used in place of `torch.nn.utils.clip_grad_value_`.
+
+        Example:
+
+        ```python
+        >>> from accelerate import Accelerator
+
+        >>> accelerator = Accelerator(gradient_accumulation_steps=2)
+        >>> dataloader, model, optimizer, scheduler = accelerator.prepare(dataloader, model, optimizer, scheduler)
+
+        >>> for (input, target) in dataloader:
+        ...     optimizer.zero_grad()
+        ...     output = model(input)
+        ...     loss = loss_func(output, target)
+        ...     accelerator.backward(loss)
+        ...     if accelerator.sync_gradients:
+        ...         accelerator.clip_grad_value_(model.parameters(), clip_value)
+        ...     optimizer.step()
+        ```
         """
         if self.distributed_type in [DistributedType.DEEPSPEED, DistributedType.FSDP]:
             raise Exception("DeepSpeed and FSDP  do not support `clip_grad_value_`. Use `clip_grad_norm_` instead.")
@@ -799,17 +1025,55 @@ class Accelerator:
         """
         return gather(tensor)
 
-    def reduce(self, tensor: torch.Tensor, reduction="sum"):
+    def gather_for_metrics(self, tensor):
+        """
+        Gathers `tensor` and potentially drops duplicates in the last batch if on a distributed system. Should be used
+        for gathering the inputs and targets for metric calculation.
+
+        Args:
+            tensor (`torch.Tensor`, or a nested tuple/list/dictionary of `torch.Tensor`):
+                The tensors for calculating metrics across all processes.
+        """
+        tensor = self.gather(tensor)
+        if self.use_distributed:
+            if self.gradient_state.remainder == -1:
+                logger.info(
+                    "The used dataset had no length, returning gathered tensors. You should drop the remainder yourself."
+                )
+                return tensor
+            try:
+                # Then see if we're on the last batch of our eval dataloader
+                if self.gradient_state.end_of_dataloader:
+                    # Last batch needs to be truncated on distributed systems as it contains additional samples
+                    def _adjust_samples(tensor):
+                        return tensor[: self.gradient_state.remainder]
+
+                    return recursively_apply(_adjust_samples, tensor)
+                else:
+                    # Not at the end of the dataloader, no need to adjust the tensors
+                    return tensor
+            except:
+                # Dataset had no length or raised an error
+                return tensor
+        return tensor
+
+    def reduce(self, tensor, reduction="sum"):
         """
         Reduce the values in *tensor* across all processes based on *reduction*.
 
+        Note:
+            All processes get the reduced value.
+
         Args:
-            tensor (`torch.Tensor`):
+            tensor (`torch.Tensor`, or a nested tuple/list/dictionary of `torch.Tensor`):
                 The tensors to reduce across all processes.
             reduction (`str`, *optional*, defaults to "sum"):
                 A reduction type, can be one of 'sum', 'mean', or 'none'. If 'none', will not perform any operation.
+
+        Returns:
+            `torch.Tensor`, or a nested tuple/list/dictionary of `torch.Tensor`: The reduced tensor(s).
         """
-        reduce(tensor, reduction)
+        return reduce(tensor, reduction)
 
     def pad_across_processes(self, tensor, dim=0, pad_index=0, pad_first=False):
         """
@@ -846,7 +1110,8 @@ class Accelerator:
         """
         wait_for_everyone()
 
-    def init_trackers(self, project_name: str, config: Optional[dict] = None):
+    @on_main_process
+    def init_trackers(self, project_name: str, config: Optional[dict] = None, init_kwargs: Optional[dict] = {}):
         """
         Initializes a run for all trackers stored in `self.log_with`, potentially with starting configurations
 
@@ -855,6 +1120,12 @@ class Accelerator:
                 The name of the project. All trackers will save their data based on this
             config (`dict`, *optional*):
                 Optional starting configuration to be logged.
+            init_kwargs (`dict`, *optional*):
+                A nested dictionary of kwargs to be passed to a specific tracker's `__init__` function. Should be
+                formatted like this:
+                ```python
+                {"wandb": {"tags": ["tag_a", "tag_b"]}}
+                ```
         """
         self.trackers = []
         for tracker in self.log_with:
@@ -865,34 +1136,56 @@ class Accelerator:
                 tracker_init = LOGGER_TYPE_TO_CLASS[str(tracker)]
                 if getattr(tracker_init, "requires_logging_directory"):
                     # We can skip this check since it was done in `__init__`
-                    self.trackers.append(tracker_init(project_name, self.logging_dir))
+                    self.trackers.append(
+                        tracker_init(project_name, self.logging_dir, **init_kwargs.get(str(tracker), {}))
+                    )
                 else:
-                    self.trackers.append(tracker_init(project_name))
+                    self.trackers.append(tracker_init(project_name, **init_kwargs.get(str(tracker), {})))
         if config is not None:
             for tracker in self.trackers:
                 tracker.store_init_configuration(config)
 
-    def log(self, values: dict, step: Optional[int] = None):
+    @on_main_process
+    def get_tracker(self, name: str):
         """
-        Logs `values` to all stored trackers in `self.trackers`.
+        Returns a `tracker` from `self.trackers` based on `name` on the main process only.
+
+        Args:
+            name (`str`):
+                The name of a tracker, corresponding to the `.name` property.
+        """
+        for tracker in self.trackers:
+            if tracker.name == name:
+                return tracker.tracker
+        raise ValueError(f"{name} is not an available tracker stored inside the `Accelerator`.")
+
+    @on_main_process
+    def log(self, values: dict, step: Optional[int] = None, log_kwargs: Optional[dict] = {}):
+        """
+        Logs `values` to all stored trackers in `self.trackers` on the main process only.
 
         Args:
             values (`dict`):
                 Values should be a dictionary-like object containing only types `int`, `float`, or `str`.
             step (`int`, *optional*):
                 The run step. If included, the log will be affiliated with this step.
+            log_kwargs (`dict`, *optional*):
+                A nested dictionary of kwargs to be passed to a specific tracker's `log` function. Should be formatted
+                like this:
+                ```python
+                {"wandb": {"tags": ["tag_a", "tag_b"]}}
+                ```
         """
-        if self.is_main_process:
-            for tracker in self.trackers:
-                tracker.log(values, step=step)
+        for tracker in self.trackers:
+            tracker.log(values, step=step, **log_kwargs.get(tracker.name, {}))
 
+    @on_main_process
     def end_training(self):
         """
-        Runs any special end training behaviors, such as stopping trackers
+        Runs any special end training behaviors, such as stopping trackers on the main process only.
         """
-        if self.is_main_process:
-            for tracker in self.trackers:
-                tracker.finish()
+        for tracker in self.trackers:
+            tracker.finish()
 
     def save(self, obj, f):
         """
@@ -909,6 +1202,13 @@ class Accelerator:
         """
         Saves the current states of the model, optimizer, scaler, RNG generators, and registered objects.
 
+        <Tip>
+
+        Should only be used when wanting to save a checkpoint during training and restoring the state in the same
+        environment.
+
+        </Tip>
+
         Args:
             output_dir (`str` or `os.PathLike`):
                 The name of the folder to save all relevant weights and states.
@@ -917,9 +1217,44 @@ class Accelerator:
         output_dir = os.path.expanduser(output_dir)
         os.makedirs(output_dir, exist_ok=True)
         logger.info(f"Saving current state to {output_dir}")
-        weights = [self.get_state_dict(m) for m in self._models]
+
+        # Save the models taking care of FSDP and DeepSpeed nuances
+        weights = []
+        for i, model in enumerate(self._models):
+            if self.distributed_type == DistributedType.FSDP:
+                logger.info("Saving FSDP model")
+                self.state.fsdp_plugin.save_model(self, model, output_dir, i)
+                logger.info(f"FSDP Model saved to output dir {output_dir}")
+            elif self.distributed_type == DistributedType.DEEPSPEED:
+                logger.info("Saving DeepSpeed Model and Optimizer")
+                ckpt_id = f"{MODEL_NAME}" if i == 0 else f"{MODEL_NAME}_{i}"
+                model.save_checkpoint(output_dir, ckpt_id)
+                logger.info(f"DeepSpeed Model and Optimizer saved to output dir {os.path.join(output_dir, ckpt_id)}")
+            else:
+                weights.append(self.get_state_dict(model, unwrap=False))
+
+        # Save the optimizers taking care of FSDP and DeepSpeed nuances
+        optimizers = []
+        if self.distributed_type == DistributedType.FSDP:
+            for opt in self._optimizers:
+                logger.info("Saving FSDP Optimizer")
+                self.state.fsdp_plugin.save_optimizer(self, opt, self._models[i], output_dir, i)
+                logger.info(f"FSDP Optimizer saved to output dir {output_dir}")
+        elif self.distributed_type != DistributedType.DEEPSPEED:
+            optimizers = self._optimizers
+
+        # Save the lr schedulers taking care of DeepSpeed nuances
+        schedulers = []
+        if self.distributed_type == DistributedType.DEEPSPEED:
+            for i, scheduler in enumerate(self._schedulers):
+                if isinstance(scheduler, DeepSpeedSchedulerWrapper):
+                    continue
+                schedulers.append(scheduler)
+        else:
+            schedulers = self._schedulers
+
         save_location = save_accelerator_state(
-            output_dir, weights, self._optimizers, self._schedulers, self.state.process_index, self.scaler
+            output_dir, weights, optimizers, schedulers, self.state.process_index, self.scaler
         )
         for i, obj in enumerate(self._custom_objects):
             save_custom_state(obj, output_dir, i)
@@ -928,6 +1263,12 @@ class Accelerator:
     def load_state(self, input_dir: str):
         """
         Loads the current states of the model, optimizer, scaler, RNG generators, and registered objects.
+
+        <Tip>
+
+        Should only be used in conjunction with [`Accelerator.save_state`].
+
+        </Tip>
 
         Args:
             input_dir (`str` or `os.PathLike`):
@@ -938,9 +1279,43 @@ class Accelerator:
         if not os.path.isdir(input_dir):
             raise ValueError(f"Tried to find {input_dir} but folder does not exist")
         logger.info(f"Loading states from {input_dir}")
-        load_accelerator_state(
-            input_dir, self._models, self._optimizers, self._schedulers, self.state.process_index, self.scaler
-        )
+
+        # Load the models taking care of FSDP and DeepSpeed nuances
+        models = []
+        for i, model in enumerate(self._models):
+            if self.distributed_type == DistributedType.FSDP:
+                logger.info("Loading FSDP model")
+                self.state.fsdp_plugin.load_model(self, model, input_dir, i)
+                logger.info(f"FSDP Model loaded from input dir {input_dir}")
+            elif self.distributed_type == DistributedType.DEEPSPEED:
+                logger.info("Loading DeepSpeed Model and Optimizer")
+                ckpt_id = f"{MODEL_NAME}" if i == 0 else f"{MODEL_NAME}_{i}"
+                model.load_checkpoint(input_dir, ckpt_id)
+                logger.info(f"DeepSpeed Model and Optimizer loaded from input dir {os.path.join(input_dir, ckpt_id)}")
+            else:
+                models.append(model)
+
+        # Load the optimizers taking care of FSDP and DeepSpeed nuances
+        optimizers = []
+        if self.distributed_type == DistributedType.FSDP:
+            for i, opt in enumerate(self._optimizers):
+                logger.info("Loading FSDP Optimizer")
+                self.state.fsdp_plugin.load_optimizer(self, opt, self._models[i], input_dir, i)
+                logger.info(f"FSDP Optimizer loaded from input dir {input_dir}")
+        elif self.distributed_type != DistributedType.DEEPSPEED:
+            optimizers = self._optimizers
+
+        # Load the lr schedulers taking care of DeepSpeed nuances
+        schedulers = []
+        if self.distributed_type == DistributedType.DEEPSPEED:
+            for i, scheduler in enumerate(self._schedulers):
+                if isinstance(scheduler, DeepSpeedSchedulerWrapper):
+                    continue
+                schedulers.append(scheduler)
+        else:
+            schedulers = self._schedulers
+
+        load_accelerator_state(input_dir, models, optimizers, schedulers, self.state.process_index, self.scaler)
         custom_checkpoints = [f for f in os.listdir(input_dir) if "custom_checkpoint" in f]
         if len(custom_checkpoints) != len(self._custom_objects):
             err = "Warning! Number of found checkpoints does not match the number of registered objects:"
@@ -996,7 +1371,7 @@ class Accelerator:
                         break
         return (model_device, optimizer_device)
 
-    def get_state_dict(self, model):
+    def get_state_dict(self, model, unwrap=True):
         is_zero_3 = False
         if self.distributed_type == DistributedType.DEEPSPEED:
             is_zero_3 = self.deepspeed_config["zero_optimization"]["stage"] == 3
@@ -1012,7 +1387,8 @@ class Accelerator:
                     "To save the full checkpoint, run `model.save_checkpoint(save_dir)` and use `zero_to_fp32.py` to recover weights."
                 )
         else:
-            model = self.unwrap_model(model)
+            if unwrap:
+                model = self.unwrap_model(model)
             state_dict = model.state_dict()
 
         if state_dict is not None:
@@ -1055,8 +1431,10 @@ class Accelerator:
         if self.native_amp:
             if self.mixed_precision == "fp16" and is_torch_version(">=", "1.10"):
                 autocast_context = torch.cuda.amp.autocast(dtype=torch.float16)
-            elif self.mixed_precision == "bf16":
-                autocast_context = torch.cuda.amp.autocast(dtype=torch.bfloat16)
+            elif self.mixed_precision == "bf16" and is_bf16_available():
+                if self.distributed_type in [DistributedType.NO, DistributedType.MULTI_CPU, DistributedType.MULTI_GPU]:
+                    device_type = "cpu" if not torch.cuda.is_available() else "cuda"
+                    autocast_context = torch.autocast(dtype=torch.bfloat16, device_type=device_type)
             else:
                 autocast_context = torch.cuda.amp.autocast()
 

@@ -28,7 +28,7 @@ from .imports import is_deepspeed_available, is_tpu_available
 if is_deepspeed_available():
     from deepspeed import DeepSpeedEngine
 
-if is_tpu_available():
+if is_tpu_available(check_device=False):
     import torch_xla.core.xla_model as xm
 
 
@@ -65,6 +65,7 @@ def wait_for_everyone():
         AcceleratorState().distributed_type == DistributedType.MULTI_GPU
         or AcceleratorState().distributed_type == DistributedType.MULTI_CPU
         or AcceleratorState().distributed_type == DistributedType.DEEPSPEED
+        or AcceleratorState().distributed_type == DistributedType.FSDP
     ):
         torch.distributed.barrier()
     elif AcceleratorState().distributed_type == DistributedType.TPU:

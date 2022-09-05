@@ -28,6 +28,8 @@ from typing import Any, Callable, Iterable, Optional
 
 import torch
 
+from .constants import FSDP_AUTO_WRAP_POLICY, FSDP_BACKWARD_PREFETCH, FSDP_STATE_DICT_TYPE, MODEL_NAME, OPTIMIZER_NAME
+
 
 class KwargsHandler:
     """
@@ -58,6 +60,8 @@ class DistributedDataParallelKwargs(KwargsHandler):
 
     `gradient_as_bucket_view` is only available in PyTorch 1.7.0 and later versions.
 
+    `static_graph` is only available in PyTorch 1.11.0 and later versions.
+
     </Tip>"""
 
     dim: int = 0
@@ -66,6 +70,7 @@ class DistributedDataParallelKwargs(KwargsHandler):
     find_unused_parameters: bool = False
     check_reduction: bool = False
     gradient_as_bucket_view: bool = False
+    static_graph: bool = False
 
 
 @dataclass
@@ -121,6 +126,7 @@ class DistributedType(str, enum.Enum):
     DEEPSPEED = "DEEPSPEED"
     FSDP = "FSDP"
     TPU = "TPU"
+    MPS = "MPS"
 
 
 class SageMakerDistributedType(str, enum.Enum):
@@ -179,13 +185,33 @@ class BaseEnum(enum.Enum, metaclass=EnumWithContains):
 
 
 class LoggerType(BaseEnum):
+    """Represents a type of supported experiment tracker
+
+    Values:
+
+        - **ALL** -- all available trackers in the environment that are supported
+        - **TENSORBOARD** -- TensorBoard as an experiment tracker
+        - **WANDB** -- wandb as an experiment tracker
+        - **COMETML** -- comet_ml as an experiment tracker
+    """
+
     ALL = "all"
+    AIM = "aim"
     TENSORBOARD = "tensorboard"
     WANDB = "wandb"
     COMETML = "comet_ml"
 
 
 class PrecisionType(BaseEnum):
+    """Represents a type of precision used on floating point values
+
+    Values:
+
+        - **NO** -- using full precision (FP32)
+        - **FP16** -- using half precision
+        - **BF16** -- using brain floating point precision
+    """
+
     NO = "no"
     FP16 = "fp16"
     BF16 = "bf16"
@@ -362,7 +388,7 @@ class DeepSpeedPlugin:
     def set_mixed_precision(self, mixed_precision):
         ds_config = self.deepspeed_config
         if mixed_precision == "fp16" and "fp16" not in ds_config and "bf16" not in ds_config:
-            ds_config.update({"fp16": {"enabled": True}})
+            ds_config.update({"fp16": {"enabled": True, "auto_cast": True}})
         elif mixed_precision == "bf16" and "fp16" not in ds_config and "bf16" not in ds_config:
             ds_config.update({"bf16": {"enabled": True}})
 
@@ -399,31 +425,63 @@ class FullyShardedDataParallelPlugin:
 
     sharding_strategy: "typing.Any" = field(
         default=None,
-        metadata={"help": "Possible options are [1] FULL_SHARD, [2] SHARD_GRAD_OP"},
+        metadata={
+            "help": "FSDP Sharding Strategy of type `torch.distributed.fsdp.fully_sharded_data_parallel.ShardingStrategy`"
+        },
     )
     backward_prefetch: "typing.Any" = field(
         default=None,
-        metadata={"help": "Possible options are [1] BACKWARD_PRE, [2] BACKWARD_POST"},
+        metadata={
+            "help": "FSDP Backward Prefetch of type `torch.distributed.fsdp.fully_sharded_data_parallel.BackwardPrefetch`"
+        },
     )
-    auto_wrap_policy: "typing.Any" = field(
+    mixed_precision_policy: "typing.Any" = field(
+        default=None,
+        metadata={
+            "help": "A config to enable mixed precision training with FullyShardedDataParallel. "
+            "The 3 flags that are set are `param_dtype`, `reduce_dtype`, `buffer_dtype`. "
+            "Each flag expects `torch.dtype` as the value. "
+            "It is of type `torch.distributed.fsdp.fully_sharded_data_parallel.MixedPrecision`."
+        },
+    )
+    auto_wrap_policy: Optional[Callable] = field(
         default=None,
         metadata={"help": "A callable specifying a policy to recursively wrap layers with FSDP"},
     )
-    cpu_offload: Optional[Callable] = field(
+    cpu_offload: "typing.Any" = field(
         default=None,
-        metadata={"help": "Decides Whether to offload parameters and gradients to CPU."},
-    )
-    min_num_params: int = field(
-        default=None, metadata={"help": "FSDP's minimum number of parameters for Default Auto Wrapping."}
+        metadata={
+            "help": "Decides Whether to offload parameters and gradients to CPU. "
+            "It is of type `torch.distributed.fsdp.fully_sharded_data_parallel.CPUOffload`."
+        },
     )
     ignored_modules: Optional[Iterable[torch.nn.Module]] = field(
         default=None,
         metadata={"help": "A list of modules to ignore for FSDP."},
     )
 
+    state_dict_type: "typing.Any" = field(
+        default=None,
+        metadata={
+            "help": "FSDP State Dict Type of type `torch.distributed.fsdp.fully_sharded_data_parallel.StateDictType`"
+        },
+    )
+
+    state_dict_config: "typing.Any" = field(
+        default=None,
+        metadata={
+            "help": "FSDP State Dict Config of type `torch.distributed.fsdp.fully_sharded_data_parallel.StateDictConfig`"
+        },
+    )
+
     def __post_init__(self):
-        from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload, ShardingStrategy
-        from torch.distributed.fsdp.wrap import default_auto_wrap_policy
+        from torch.distributed.fsdp.fully_sharded_data_parallel import (
+            BackwardPrefetch,
+            CPUOffload,
+            ShardingStrategy,
+            StateDictType,
+            _state_dict_type_to_config,
+        )
 
         if self.sharding_strategy is None:
             self.sharding_strategy = ShardingStrategy(int(os.environ.get("FSDP_SHARDING_STRATEGY", 1)))
@@ -434,9 +492,155 @@ class FullyShardedDataParallelPlugin:
             else:
                 self.cpu_offload = CPUOffload(offload_params=False)
 
-        if self.min_num_params is None:
-            self.min_num_params = int(os.environ.get("FSDP_MIN_NUM_PARAMS", 0))
+        if self.backward_prefetch is None:
+            prefetch_policy = os.environ.get("FSDP_BACKWARD_PREFETCH", "NO_PREFETCH")
+            if prefetch_policy != FSDP_BACKWARD_PREFETCH[-1]:
+                self.backward_prefetch = BackwardPrefetch(FSDP_BACKWARD_PREFETCH.index(prefetch_policy) + 1)
+
+        if self.state_dict_type is None:
+            state_dict_type_policy = os.environ.get("FSDP_STATE_DICT_TYPE", "FULL_STATE_DICT")
+            self.state_dict_type = StateDictType(FSDP_STATE_DICT_TYPE.index(state_dict_type_policy) + 1)
+
+            if self.state_dict_type == StateDictType.FULL_STATE_DICT:
+                self.state_dict_config = _state_dict_type_to_config[self.state_dict_type](
+                    offload_to_cpu=True, rank0_only=True
+                )
+            else:
+                self.state_dict_config = _state_dict_type_to_config[self.state_dict_type]()
+
+    @staticmethod
+    def get_module_class_from_name(module, name):
+        """
+        Gets a class from a module by its name.
+
+        Args:
+            module (`torch.nn.Module`): The module to get the class from.
+            name (`str`): The name of the class.
+        """
+        modules_children = list(module.children())
+        if module.__class__.__name__ == name:
+            return module.__class__
+        elif len(modules_children) == 0:
+            return
+        else:
+            for child_module in modules_children:
+                module_class = FullyShardedDataParallelPlugin.get_module_class_from_name(child_module, name)
+                if module_class is not None:
+                    return module_class
+
+    def set_auto_wrap_policy(self, model):
+        from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
 
         if self.auto_wrap_policy is None:
-            if self.min_num_params > 0:
-                self.auto_wrap_policy = functools.partial(default_auto_wrap_policy, min_num_params=self.min_num_params)
+            auto_wrap_policy = os.environ.get("FSDP_AUTO_WRAP_POLICY", "NO_WRAP")
+            if auto_wrap_policy == FSDP_AUTO_WRAP_POLICY[0]:
+                transformer_cls_to_wrap = os.environ.get("FSDP_TRANSFORMER_CLS_TO_WRAP", "")
+                transformer_cls_to_wrap = FullyShardedDataParallelPlugin.get_module_class_from_name(
+                    model, transformer_cls_to_wrap
+                )
+                if transformer_cls_to_wrap is None:
+                    raise Exception("Could not find the transformer layer class to wrap in the model.")
+                self.auto_wrap_policy = functools.partial(
+                    transformer_auto_wrap_policy,
+                    # Transformer layer class to wrap
+                    transformer_layer_cls={transformer_cls_to_wrap},
+                )
+            elif auto_wrap_policy == FSDP_AUTO_WRAP_POLICY[1]:
+                min_num_params = int(os.environ.get("FSDP_MIN_NUM_PARAMS", 0))
+                if min_num_params > 0:
+                    self.auto_wrap_policy = functools.partial(
+                        size_based_auto_wrap_policy, min_num_params=min_num_params
+                    )
+
+    def set_mixed_precision(self, mixed_precision):
+        if mixed_precision == "fp16":
+            dtype = torch.float16
+        elif mixed_precision == "bf16":
+            dtype = torch.bfloat16
+        else:
+            raise ValueError(f"Unknown mixed precision value: {mixed_precision}")
+        from torch.distributed.fsdp.fully_sharded_data_parallel import MixedPrecision
+
+        if self.mixed_precision_policy is None:
+            self.mixed_precision_policy = MixedPrecision(param_dtype=dtype, reduce_dtype=dtype, buffer_dtype=dtype)
+
+    def save_model(self, accelerator, model, output_dir, model_index=0):
+        from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
+
+        if self.state_dict_type == StateDictType.FULL_STATE_DICT:
+            with FSDP.state_dict_type(model, self.state_dict_type, self.state_dict_config):
+                state_dict = model.state_dict()
+            weights_name = f"{MODEL_NAME}.bin" if model_index == 0 else f"{MODEL_NAME}_{model_index}.bin"
+            output_model_file = os.path.join(output_dir, weights_name)
+            if accelerator.process_index == 0:
+                print(f"Saving model to {output_model_file}")
+                torch.save(state_dict, output_model_file)
+                print(f"Model saved to {output_model_file}")
+        else:
+            with FSDP.state_dict_type(model, self.state_dict_type, self.state_dict_config):
+                state_dict = model.state_dict()
+            weights_name = (
+                f"{MODEL_NAME}_rank{accelerator.process_index}.bin"
+                if model_index == 0
+                else f"{MODEL_NAME}_{model_index}_rank{accelerator.process_index}.bin"
+            )
+            output_model_file = os.path.join(output_dir, weights_name)
+            print(f"Saving model to {output_model_file}")
+            torch.save(state_dict, output_model_file)
+            print(f"Model saved to {output_model_file}")
+
+    def load_model(self, accelerator, model, input_dir, model_index=0):
+        from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
+
+        accelerator.wait_for_everyone()
+
+        if self.state_dict_type == StateDictType.FULL_STATE_DICT:
+            weights_name = f"{MODEL_NAME}.bin" if model_index == 0 else f"{MODEL_NAME}_{model_index}.bin"
+            input_model_file = os.path.join(input_dir, weights_name)
+            accelerator.print(f"Loading model from {input_model_file}")
+            state_dict = torch.load(input_model_file)
+            accelerator.print(f"Model loaded from {input_model_file}")
+        else:
+            weights_name = (
+                f"{MODEL_NAME}_rank{accelerator.process_index}.bin"
+                if model_index == 0
+                else f"{MODEL_NAME}_{model_index}_rank{accelerator.process_index}.bin"
+            )
+            input_model_file = os.path.join(input_dir, weights_name)
+            print(f"Loading model from {input_model_file}")
+            state_dict = torch.load(input_model_file)
+            print(f"Model loaded from {input_model_file}")
+        with FSDP.state_dict_type(model, self.state_dict_type, self.state_dict_config):
+            model.load_state_dict(state_dict)
+
+    def save_optimizer(self, accelerator, optimizer, model, output_dir, optimizer_index=0, optim_input=None):
+        from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
+
+        optim_state = FSDP.full_optim_state_dict(model, optimizer, optim_input=optim_input)
+        if accelerator.process_index == 0:
+            optim_state_name = (
+                f"{OPTIMIZER_NAME}.bin" if optimizer_index == 0 else f"{OPTIMIZER_NAME}_{optimizer_index}.bin"
+            )
+            output_optimizer_file = os.path.join(output_dir, optim_state_name)
+            print(f"Saving Optimizer state to {output_optimizer_file}")
+            torch.save(optim_state, output_optimizer_file)
+            print(f"Optimizer state saved in {output_optimizer_file}")
+
+    def load_optimizer(self, accelerator, optimizer, model, input_dir, optimizer_index=0):
+        from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
+
+        accelerator.wait_for_everyone()
+        full_osd = None
+        if accelerator.process_index == 0:
+            optimizer_name = (
+                f"{OPTIMIZER_NAME}.bin" if optimizer_index == 0 else f"{OPTIMIZER_NAME}_{optimizer_index}.bin"
+            )
+            input_optimizer_file = os.path.join(input_dir, optimizer_name)
+            print(f"Loading Optimizer state from {input_optimizer_file}")
+            full_osd = torch.load(input_optimizer_file)
+            print(f"Optimizer state loaded from {input_optimizer_file}")
+        # called from all ranks, though only rank0 has a valid param for full_osd
+        sharded_osd = FSDP.scatter_full_optim_state_dict(full_osd, model)
+        optimizer.load_state_dict(sharded_osd)

@@ -83,6 +83,9 @@ if os.environ.get("TESTING_MOCKED_DATALOADERS", None) == "1":
 
 
 def training_function(config, args):
+    # For testing only
+    if os.environ.get("TESTING_MOCKED_DATALOADERS", None) == "1":
+        config["num_epochs"] = 2
     # Initialize accelerator
     if args.with_tracking:
         accelerator = Accelerator(
@@ -111,12 +114,8 @@ def training_function(config, args):
 
     # We need to initialize the trackers we use, and also store our configuration
     if args.with_tracking:
-        if accelerator.is_main_process:
-            run = os.path.split(__file__)[-1].split(".")[0]
-            if args.logging_dir:
-                run = os.path.join(args.logging_dir, run)
-                accelerator.print(run)
-            accelerator.init_trackers(run, config)
+        experiment_config = vars(args)
+        accelerator.init_trackers("fsdp_glue_no_trainer", experiment_config)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     datasets = load_dataset("glue", "mrpc")
@@ -128,11 +127,13 @@ def training_function(config, args):
         return outputs
 
     # Apply the method we just defined to all the examples in all the splits of the dataset
-    tokenized_datasets = datasets.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=["idx", "sentence1", "sentence2"],
-    )
+    # starting with the main process first:
+    with accelerator.main_process_first():
+        tokenized_datasets = datasets.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=["idx", "sentence1", "sentence2"],
+        )
 
     # We also rename the 'label' column to 'labels' which is the expected name for labels by the models of the
     # transformers library
@@ -140,7 +141,7 @@ def training_function(config, args):
 
     # If the batch size is too big we use gradient accumulation
     gradient_accumulation_steps = 1
-    if batch_size > MAX_GPU_BATCH_SIZE:
+    if batch_size > MAX_GPU_BATCH_SIZE and accelerator.distributed_type != DistributedType.TPU:
         gradient_accumulation_steps = batch_size // MAX_GPU_BATCH_SIZE
         batch_size = MAX_GPU_BATCH_SIZE
 
@@ -165,6 +166,7 @@ def training_function(config, args):
     # New Code #
     # For FSDP feature, it is highly recommended and efficient to prepare the model before creating optimizer
     model = accelerator.prepare(model)
+    accelerator.print(model)
 
     # Instantiate optimizer
     # New Code #
@@ -272,23 +274,13 @@ def training_function(config, args):
         # context manager to track the peak memory usage during the evaluation
         with TorchTracemalloc() as tracemalloc:
             model.eval()
-            samples_seen = 0
             for step, batch in enumerate(eval_dataloader):
                 # We could avoid this line since we set the accelerator with `device_placement=True`.
                 batch.to(accelerator.device)
                 with torch.no_grad():
                     outputs = model(**batch)
                 predictions = outputs.logits.argmax(dim=-1)
-                # It is slightly faster to call this once, than multiple times
-                predictions, references = accelerator.gather(
-                    (predictions, batch["labels"])
-                )  # If we are in a multiprocess environment, the last batch has duplicates
-                if accelerator.num_processes > 1:
-                    if step == len(eval_dataloader) - 1:
-                        predictions = predictions[: len(eval_dataloader.dataset) - samples_seen]
-                        references = references[: len(eval_dataloader.dataset) - samples_seen]
-                    else:
-                        samples_seen += references.shape[0]
+                predictions, references = accelerator.gather_for_metrics((predictions, batch["labels"]))
                 metric.add_batch(
                     predictions=predictions,
                     references=references,
