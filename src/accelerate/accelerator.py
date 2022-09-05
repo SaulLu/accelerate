@@ -221,6 +221,7 @@ class Accelerator:
                         self.init_handler = handler
 
         kwargs = self.init_handler.to_kwargs() if self.init_handler is not None else {}
+        import pdb; pdb.set_trace()
         self.state = AcceleratorState(
             mixed_precision=mixed_precision,
             cpu=cpu,
