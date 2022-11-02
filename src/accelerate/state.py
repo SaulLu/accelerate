@@ -68,6 +68,8 @@ class AcceleratorState:
             cpu = True
         self._check_initialized(mixed_precision, cpu)
         self.fork_launched = parse_flag_from_env("FORK_LAUNCHED", 0)
+
+        import pdb; pdb.set_trace()
         if not getattr(self, "initialized", False):
             self.backend = None
             self.deepspeed_plugin = None
